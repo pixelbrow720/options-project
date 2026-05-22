@@ -11,6 +11,8 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
+
+from app.db.migrations.tsdb_helper import safe_execute_tsdb
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0003"
@@ -35,14 +37,8 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("ts", "symbol", "seq"),
     )
     op.create_index("ix_futures_ticks_symbol_ts", "futures_ticks", ["symbol", "ts"])
-    op.execute(
-        "SELECT create_hypertable('futures_ticks', 'ts', if_not_exists => TRUE, "
-        "migrate_data => TRUE);"
-    )
-    op.execute(
-        "SELECT add_retention_policy('futures_ticks', INTERVAL '14 days', "
-        "if_not_exists => TRUE);"
-    )
+    safe_execute_tsdb("SELECT create_hypertable('futures_ticks', 'ts', if_not_exists => TRUE, migrate_data => TRUE)")
+    safe_execute_tsdb("SELECT add_retention_policy('futures_ticks', INTERVAL '14 days', if_not_exists => TRUE)")
 
     # ── options_trades ───────────────────────────────────────────────────
     op.create_table(
@@ -69,14 +65,8 @@ def upgrade() -> None:
         "ix_options_trades_contract", "options_trades",
         ["symbol", "expiration", "strike", "option_type"],
     )
-    op.execute(
-        "SELECT create_hypertable('options_trades', 'ts', if_not_exists => TRUE, "
-        "migrate_data => TRUE);"
-    )
-    op.execute(
-        "SELECT add_retention_policy('options_trades', INTERVAL '14 days', "
-        "if_not_exists => TRUE);"
-    )
+    safe_execute_tsdb("SELECT create_hypertable('options_trades', 'ts', if_not_exists => TRUE, migrate_data => TRUE)")
+    safe_execute_tsdb("SELECT add_retention_policy('options_trades', INTERVAL '14 days', if_not_exists => TRUE)")
 
     # ── flow_events (regular table — low volume, not time-series-ish) ────
     op.create_table(
@@ -133,14 +123,8 @@ def upgrade() -> None:
     op.create_index(
         "ix_liquidity_snapshots_symbol_ts", "liquidity_snapshots", ["symbol", "ts"]
     )
-    op.execute(
-        "SELECT create_hypertable('liquidity_snapshots', 'ts', if_not_exists => TRUE, "
-        "migrate_data => TRUE);"
-    )
-    op.execute(
-        "SELECT add_retention_policy('liquidity_snapshots', INTERVAL '7 days', "
-        "if_not_exists => TRUE);"
-    )
+    safe_execute_tsdb("SELECT create_hypertable('liquidity_snapshots', 'ts', if_not_exists => TRUE, migrate_data => TRUE)")
+    safe_execute_tsdb("SELECT add_retention_policy('liquidity_snapshots', INTERVAL '7 days', if_not_exists => TRUE)")
 
     # ── alert_rules ──────────────────────────────────────────────────────
     op.create_table(

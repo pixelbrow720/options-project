@@ -17,6 +17,8 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
+
+from app.db.migrations.tsdb_helper import safe_execute_tsdb
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0004"
@@ -217,10 +219,7 @@ def upgrade() -> None:
                     f"timescaledb.compress_orderby = 'ts DESC');"
                 )
             # add_compression_policy supports if_not_exists since TimescaleDB 2.6.
-            op.execute(
-                f"SELECT add_compression_policy('{table}', INTERVAL '1 day', "
-                f"if_not_exists => TRUE);"
-            )
+            safe_execute_tsdb("SELECT add_compression_policy('{table}', INTERVAL '1 day', if_not_exists => TRUE)")
 
         # Tighter chunk interval on options_chain (default is 7 days, but
         # our chain is high-cardinality so smaller chunks compress better

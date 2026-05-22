@@ -10,6 +10,8 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
+
+from app.db.migrations.tsdb_helper import safe_execute_tsdb
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0001"
@@ -19,8 +21,12 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    # Extension (idempotent)
-    op.execute("CREATE EXTENSION IF NOT EXISTS timescaledb;")
+    # Extension (idempotent — skipped silently on providers without TimescaleDB)
+    op.execute(
+        "DO $$ BEGIN "
+        "CREATE EXTENSION IF NOT EXISTS timescaledb; "
+        "EXCEPTION WHEN OTHERS THEN NULL; END$$;"
+    )
 
     # ── options_chain ────────────────────────────────────────────────────────
     op.create_table(
@@ -46,14 +52,8 @@ def upgrade() -> None:
         "ix_options_chain_symbol_expiry", "options_chain", ["symbol", "expiration"]
     )
 
-    op.execute(
-        "SELECT create_hypertable('options_chain', 'ts', if_not_exists => TRUE, "
-        "migrate_data => TRUE);"
-    )
-    op.execute(
-        "SELECT add_retention_policy('options_chain', INTERVAL '7 days', "
-        "if_not_exists => TRUE);"
-    )
+    safe_execute_tsdb("SELECT create_hypertable('options_chain', 'ts', if_not_exists => TRUE, migrate_data => TRUE)")
+    safe_execute_tsdb("SELECT add_retention_policy('options_chain', INTERVAL '7 days', if_not_exists => TRUE)")
 
     # ── computed_metrics ─────────────────────────────────────────────────────
     op.create_table(
@@ -88,14 +88,8 @@ def upgrade() -> None:
         "computed_metrics",
         ["symbol", "metric_type", "ts"],
     )
-    op.execute(
-        "SELECT create_hypertable('computed_metrics', 'ts', if_not_exists => TRUE, "
-        "migrate_data => TRUE);"
-    )
-    op.execute(
-        "SELECT add_retention_policy('computed_metrics', INTERVAL '7 days', "
-        "if_not_exists => TRUE);"
-    )
+    safe_execute_tsdb("SELECT create_hypertable('computed_metrics', 'ts', if_not_exists => TRUE, migrate_data => TRUE)")
+    safe_execute_tsdb("SELECT add_retention_policy('computed_metrics', INTERVAL '7 days', if_not_exists => TRUE)")
 
     # ── api_keys ─────────────────────────────────────────────────────────────
     op.create_table(
@@ -170,10 +164,7 @@ def upgrade() -> None:
         );
         """
     )
-    op.execute(
-        "SELECT add_compression_policy('options_chain', INTERVAL '1 day', "
-        "if_not_exists => TRUE);"
-    )
+    safe_execute_tsdb("SELECT add_compression_policy('options_chain', INTERVAL '1 day', if_not_exists => TRUE)")
 
 
 def downgrade() -> None:
