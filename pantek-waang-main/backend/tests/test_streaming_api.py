@@ -351,6 +351,28 @@ def _build_ws_test_client():
     return TestClient(app)
 
 
+class _FakeSession:
+    """Minimal async context manager standing in for a real DB session."""
+
+    async def get(self, model, pk):  # noqa: ARG002
+        return None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+
+def _fake_session_factory():
+    return _FakeSession()
+
+
+def _patch_session_factory(monkeypatch):
+    """Monkeypatch get_session_factory in stream module so WS tests don't need a DB."""
+    monkeypatch.setattr(stream_mod, "get_session_factory", lambda: _fake_session_factory)
+
+
 def test_ws_stream_propagates_published_payload_within_100ms(monkeypatch) -> None:
     """Publishing to the notifier should propagate to a WS subscriber.
 
@@ -360,6 +382,7 @@ def test_ws_stream_propagates_published_payload_within_100ms(monkeypatch) -> Non
     """
     stream_mod.reset_ws_state_for_tests()
     notifier_mod.reset_stream_notifier_for_tests()
+    _patch_session_factory(monkeypatch)
 
     class _FakeApiKey:
         id = "ws-propagate-key"
@@ -420,6 +443,7 @@ def test_ws_stream_caps_connections_per_key(monkeypatch) -> None:
     from app.config import get_settings
 
     stream_mod.reset_ws_state_for_tests()
+    _patch_session_factory(monkeypatch)
 
     class _FakeApiKey:
         id = "test-key-id"
@@ -471,6 +495,7 @@ def test_ws_stream_rejects_missing_api_key(monkeypatch) -> None:
     from starlette.websockets import WebSocketDisconnect
 
     stream_mod.reset_ws_state_for_tests()
+    _patch_session_factory(monkeypatch)
 
     async def _fake_auth(api_key, symbol, session):  # noqa: ARG001
         return None
