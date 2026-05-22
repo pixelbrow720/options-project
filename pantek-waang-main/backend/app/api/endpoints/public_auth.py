@@ -28,6 +28,7 @@ through the bridge.
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
@@ -55,9 +56,11 @@ from app.core.discord_client import (
 )
 from app.core.logging import get_logger
 from app.core.security import (
+    consume_discord_state_nonce,
     create_discord_state_token,
     create_public_session_token,
     decode_public_session_token,
+    extract_discord_state_nonce,
     verify_api_key,
     verify_discord_state_token,
 )
@@ -154,6 +157,28 @@ def _pending_response(
     )
 
 
+def _redacted_summary(user_summary: PublicUserSummary) -> PublicUserSummary:
+    """Strip PII from a summary returned in pending/rejected 403 responses.
+
+    The user has not been approved (or has been rejected), so the
+    public callback should not echo back the email, Discord id, or any
+    bridged-key metadata that an attacker who phished a state token
+    could harvest. ``discord_username`` is preserved because the user
+    just typed it into the OAuth consent screen — confirming it back
+    is harmless and improves the UX of the waiting page.
+    """
+    return user_summary.model_copy(
+        update={
+            "email": None,
+            "discord_id": "redacted",
+            "api_key_label": None,
+            "api_key_prefix": None,
+            "allowed_symbols": [],
+            "has_api_key": False,
+        }
+    )
+
+
 # ── Discord OAuth start ──────────────────────────────────────────────────────
 
 
@@ -211,6 +236,12 @@ async def discord_callback(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid or expired state token",
         )
+    nonce = extract_discord_state_nonce(state)
+    if nonce is None or not consume_discord_state_nonce(nonce):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="State nonce already used or unknown",
+        )
     if not (settings.discord_client_id and settings.discord_client_secret):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -237,9 +268,12 @@ async def discord_callback(
 
     # Guild membership probe is best-effort: we still create / load the
     # user row even if the bot can't see them, so admins have a record.
-    guild_verified = False
+    # Tri-state: True = confirmed member, False = definitive non-member
+    # (HTTP 404), None = unknown (transport/5xx). On unknown we keep the
+    # previous ``guild_verified`` value rather than revoking on a blip.
+    probe_result: bool | None = None
     if settings.discord_guild_id and settings.discord_bot_token:
-        guild_verified = await is_member_of_guild(
+        probe_result = await is_member_of_guild(
             user_id=discord_user.id,
             guild_id=settings.discord_guild_id,
             bot_token=settings.discord_bot_token,
@@ -251,6 +285,7 @@ async def discord_callback(
     ).scalar_one_or_none()
 
     if existing is None:
+        guild_verified = bool(probe_result) if probe_result is not None else False
         user = User(
             discord_id=discord_user.id,
             discord_username=discord_user.username,
@@ -271,12 +306,26 @@ async def discord_callback(
         existing.discord_avatar = discord_user.avatar
         if discord_user.email:
             existing.email = discord_user.email
-        existing.guild_verified = guild_verified
+        existing_was_verified = bool(existing.guild_verified)
+        if probe_result is True:
+            existing.guild_verified = True
+        elif probe_result is False:
+            # Definitive 404. Only downgrade if the user wasn't
+            # previously verified, so a transient probe glitch followed
+            # by a real 404 still requires explicit admin action to
+            # revoke. Keeping the existing True covers the case where
+            # Discord is briefly returning the wrong status.
+            if not existing_was_verified:
+                existing.guild_verified = False
+        else:
+            # Unknown — keep whatever we already had.
+            existing.guild_verified = existing_was_verified
         await session.commit()
         await session.refresh(existing)
         user = existing
 
     summary = await _summary_for(user, session)
+    guild_verified = bool(user.guild_verified)
 
     if user.status == "banned":
         raise HTTPException(
@@ -287,7 +336,8 @@ async def discord_callback(
     if user.status == "rejected":
         return Response(
             content=_pending_response(
-                summary, detail="Access was rejected by an administrator."
+                _redacted_summary(summary),
+                detail="Access was rejected by an administrator.",
             ).model_dump_json(),
             status_code=status.HTTP_403_FORBIDDEN,
             media_type="application/json",
@@ -306,7 +356,9 @@ async def discord_callback(
         else "Approved, but your API key has not been provisioned yet."
     )
     return Response(
-        content=_pending_response(summary, detail=detail).model_dump_json(),
+        content=_pending_response(
+            _redacted_summary(summary), detail=detail
+        ).model_dump_json(),
         status_code=status.HTTP_403_FORBIDDEN,
         media_type="application/json",
     )
@@ -430,8 +482,14 @@ async def logout(
     sid = payload.get("sid")
     if not sid:
         return Response(status_code=204)
+    try:
+        session_uuid = uuid.UUID(str(sid))
+    except (ValueError, TypeError):
+        return Response(status_code=204)
     await session.execute(
-        update(UserSession).where(UserSession.id == sid).values(revoked=True)
+        update(UserSession)
+        .where(UserSession.id == session_uuid)
+        .values(revoked=True)
     )
     await session.commit()
     return Response(status_code=204)

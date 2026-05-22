@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 import {
   Area,
   AreaChart,
@@ -37,7 +37,7 @@ export interface GexChartProps {
   description?: string;
 }
 
-export function GexChart({ payload, title = "GEX", description }: GexChartProps) {
+function GexChartImpl({ payload, title = "GEX", description }: GexChartProps) {
   const data = useMemo(() => {
     const curve = payload?.curve ?? [];
     return [...curve]
@@ -144,3 +144,21 @@ export function GexChart({ payload, title = "GEX", description }: GexChartProps)
     </Card>
   );
 }
+
+// The chart re-renders on every WS frame even when the curve hasn't changed
+// (recharts is expensive). Skip the render if the payload is identifiably
+// the same: same length, same total, same computed_at marker (which the
+// backend bumps whenever a new frame is produced).
+export const GexChart = memo(GexChartImpl, (prev, next) => {
+  if (prev.title !== next.title || prev.description !== next.description) return false;
+  const a = prev.payload;
+  const b = next.payload;
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    (a.curve?.length ?? 0) === (b.curve?.length ?? 0) &&
+    a.net_total === b.net_total &&
+    a.zero_gamma === b.zero_gamma &&
+    a.underlying_price === b.underlying_price
+  );
+});

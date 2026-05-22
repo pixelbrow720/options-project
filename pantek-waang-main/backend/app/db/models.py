@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, date, datetime
 
 from sqlalchemy import (
     ARRAY,
@@ -12,6 +12,7 @@ from sqlalchemy import (
     Boolean,
     Date,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -20,6 +21,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -75,18 +77,27 @@ class ComputedMetric(Base):
     strike: Mapped[float | None] = mapped_column(
         Numeric(20, 6), primary_key=True, nullable=False, default=0
     )
-    expiration: Mapped[datetime | None] = mapped_column(
-        Date, primary_key=True, nullable=False
+    expiration: Mapped[date] = mapped_column(
+        Date, primary_key=True, nullable=False, default=date(1970, 1, 1)
     )
 
     computed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
     value: Mapped[float | None] = mapped_column(Numeric(30, 8), nullable=True)
     extra_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     __table_args__ = (
         Index("ix_computed_metrics_symbol_type_ts", "symbol", "metric_type", "ts"),
+        Index(
+            "ix_computed_metrics_0dte",
+            "symbol",
+            text("ts DESC"),
+            postgresql_where=text(
+                "metric_type LIKE 'GEX_0DTE%' OR metric_type LIKE 'CHARM_0DTE%'"
+            ),
+            postgresql_using="btree",
+        ),
     )
 
 
@@ -112,7 +123,7 @@ class EodOpenInterest(Base):
     open_interest: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
 
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
 
     __table_args__ = (
@@ -131,7 +142,7 @@ class ApiKey(Base):
     label: Mapped[str] = mapped_column(Text, nullable=False)
     allowed_symbols: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
@@ -153,7 +164,7 @@ class AdminUser(Base):
     username: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
 
 
@@ -299,7 +310,7 @@ class AlertRule(Base):
         DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
 
     __table_args__ = (
@@ -320,7 +331,7 @@ class AlertEvent(Base):
         nullable=False,
     )
     ts: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
     symbol: Mapped[str] = mapped_column(Text, nullable=False)
     matched: Mapped[list[str]] = mapped_column(
@@ -357,13 +368,13 @@ class PipelineRun(Base):
     )
     symbol: Mapped[str] = mapped_column(Text, nullable=False)
     started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
     finished_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     duration_ms: Mapped[float] = mapped_column(
-        Numeric(20, 3), nullable=False, default=0
+        Float, nullable=False, default=0.0
     )
     status: Mapped[str] = mapped_column(Text, nullable=False, default="running")
     """``running`` | ``ok`` | ``partial`` | ``failed`` | ``session_open`` | ``session_close``."""
@@ -387,6 +398,14 @@ class PipelineRun(Base):
         Numeric(20, 10), nullable=True
     )
 
+    __table_args__ = (
+        Index(
+            "ix_pipeline_runs_symbol_started",
+            "symbol",
+            text("started_at DESC"),
+        ),
+    )
+
 
 class SessionEvent(Base):
     """Lightweight audit log of session open / close / reset events.
@@ -403,9 +422,13 @@ class SessionEvent(Base):
     """``session_open`` | ``session_close`` | ``reset`` | ``partial_open``."""
     symbol: Mapped[str | None] = mapped_column(Text, nullable=True)
     ts: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
     extra_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    __table_args__ = (
+        Index("ix_session_events_ts", text("ts DESC")),
+    )
 
 
 class MetricTypeRegistry(Base):
@@ -458,7 +481,7 @@ class DatabentoApiKey(Base):
     last_error_msg: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
 
     __table_args__ = (
@@ -479,12 +502,16 @@ class DeadLetterEntry(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     ts: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
     source: Mapped[str] = mapped_column(Text, nullable=False)
     """``opra_live`` | ``opra_historical`` | ``globex_live`` | ``eod_oi`` | ``pipeline``."""
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    __table_args__ = (
+        Index("ix_dlq_source_ts", "source", text("ts DESC")),
+    )
 
 
 class BackfillCheckpoint(Base):
@@ -498,7 +525,7 @@ class BackfillCheckpoint(Base):
         DateTime(timezone=True), nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
 
 
@@ -527,7 +554,7 @@ class ContractAdv(Base):
     )
     window_days: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
 
     __table_args__ = (
@@ -579,7 +606,7 @@ class User(Base):
         nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
     last_login_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -606,7 +633,7 @@ class AccessRequest(Base):
         nullable=False,
     )
     requested_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
     approved_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -618,7 +645,9 @@ class AccessRequest(Base):
     rejected_by: Mapped[str | None] = mapped_column(Text, nullable=True)
     rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     api_key_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("api_keys.id", ondelete="SET NULL"),
+        nullable=True,
     )
 
     __table_args__ = (
@@ -640,7 +669,7 @@ class UserSession(Base):
         nullable=False,
     )
     issued_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
     )
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False

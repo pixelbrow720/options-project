@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { Link, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { ArrowRight, KeyRound, Eye, EyeOff } from "lucide-react";
 import { motion, useAnimationControls, useReducedMotion } from "framer-motion";
@@ -6,6 +6,7 @@ import { Layout } from "@/components/Layout";
 import { useAuth } from "@/lib/auth";
 import { toast } from "@/components/ui/toast";
 import { useTheme } from "@/hooks/useTheme";
+import { destinationForStatus } from "@/lib/redirects";
 
 export default function Login() {
   // Ensure data-theme is applied even when landing directly here.
@@ -28,31 +29,33 @@ export default function Login() {
 
   // Honour both router state (`from` set by <Protected>) and ?next= (set by
   // the 401 axios interceptor when the user is bounced from a protected page).
-  function resolveNext(fallback: string): string {
-    const stateFrom = (location.state as { from?: string } | null)?.from;
-    if (stateFrom && stateFrom.startsWith("/")) return stateFrom;
-    const nextParam = searchParams.get("next");
-    if (nextParam) {
-      try {
-        const decoded = decodeURIComponent(nextParam);
-        // Only allow same-origin relative paths to prevent open-redirect.
-        if (decoded.startsWith("/") && !decoded.startsWith("//")) {
-          return decoded;
+  const resolveNext = useCallback(
+    (fallback: string): string => {
+      const stateFrom = (location.state as { from?: string } | null)?.from;
+      if (stateFrom && stateFrom.startsWith("/")) return stateFrom;
+      const nextParam = searchParams.get("next");
+      if (nextParam) {
+        try {
+          const decoded = decodeURIComponent(nextParam);
+          // Only allow same-origin relative paths to prevent open-redirect.
+          if (decoded.startsWith("/") && !decoded.startsWith("//")) {
+            return decoded;
+          }
+        } catch {
+          /* ignore malformed param */
         }
-      } catch {
-        /* ignore malformed param */
       }
-    }
-    return fallback;
-  }
+      return fallback;
+    },
+    [location.state, searchParams],
+  );
 
   useEffect(() => {
     if (token && status) {
-      const target = resolveNext(redirectFor(status));
+      const target = resolveNext(destinationForStatus(status));
       navigate(target, { replace: true });
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, status, navigate]);
+  }, [token, status, navigate, resolveNext]);
 
   useEffect(() => {
     return () => {
@@ -82,7 +85,7 @@ export default function Login() {
         description: "Welcome back.",
         variant: "success",
       });
-      const dest = resolveNext(redirectFor(result.status));
+      const dest = resolveNext(destinationForStatus(result.status));
       navigate(dest, { replace: true });
     }
   }
@@ -258,10 +261,3 @@ export default function Login() {
   );
 }
 
-function redirectFor(status: string): string {
-  if (status === "approved") return "/dashboard";
-  if (status === "pending") return "/pending";
-  if (status === "rejected") return "/rejected";
-  if (status === "banned") return "/login";
-  return "/dashboard";
-}

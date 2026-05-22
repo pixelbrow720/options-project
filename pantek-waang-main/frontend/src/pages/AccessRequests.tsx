@@ -148,6 +148,9 @@ export function AccessRequestsPage() {
   }, [users, tab]);
 
   // Existing keys not yet assigned to any user (best-effort by label match).
+  // TODO(backend): expose `/admin/api-keys?unassigned=true` so we don't have
+  // to do label-name correlation client-side. Today this can show false
+  // positives if a key's label was edited after assignment.
   const unassignedKeys = useMemo(() => {
     const usedLabels = new Set(
       users
@@ -256,6 +259,7 @@ export function AccessRequestsPage() {
   }
 
   async function revokeSessions(user: AccessRequestUser) {
+    // TODO(ux): replace with Radix AlertDialog for consistent styling.
     if (!confirm(`Revoke all active sessions for ${user.discord_username}?`)) return;
     setError(null);
     try {
@@ -268,6 +272,7 @@ export function AccessRequestsPage() {
   }
 
   async function unban(user: AccessRequestUser) {
+    // TODO(ux): replace with Radix AlertDialog for consistent styling.
     if (!confirm(`Unban ${user.discord_username}? They will need a new API key assigned.`)) return;
     setError(null);
     try {

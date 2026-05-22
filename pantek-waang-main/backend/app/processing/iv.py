@@ -228,10 +228,14 @@ def _years_to_expiry(today: pd.Timestamp, expiry: pd.Timestamp) -> float:
 
 
 def _row_price(row: pd.Series) -> float:
-    """Pick the best available reference price: last → mid(bid,ask) → 0."""
-    last = row.get("last_price")
-    if last is not None and not pd.isna(last) and last > 0:
-        return float(last)
+    """Pick the best available reference price: mid(bid,ask) → last → 0.
+
+    Stale ``last_price`` from inactive contracts is a major contaminant
+    in synthesized IV — last prints can sit untouched for hours on
+    illiquid strikes. We prefer the mid whenever a usable two-sided
+    quote exists (both bid and ask positive, ask > bid), and only fall
+    back to ``last_price`` when the book is one-sided or absent.
+    """
     bid = row.get("bid")
     ask = row.get("ask")
     if (
@@ -240,9 +244,12 @@ def _row_price(row: pd.Series) -> float:
         and not pd.isna(bid)
         and not pd.isna(ask)
         and bid > 0
-        and ask > 0
+        and ask > bid
     ):
         return float((bid + ask) / 2.0)
+    last = row.get("last_price")
+    if last is not None and not pd.isna(last) and last > 0:
+        return float(last)
     return 0.0
 
 

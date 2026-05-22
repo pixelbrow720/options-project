@@ -14,7 +14,7 @@ import { useAuth } from "@/lib/AuthContext";
 import { Auth } from "@/lib/api";
 
 export function LoginPage() {
-  const [username, setUsername] = useState("admin");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);

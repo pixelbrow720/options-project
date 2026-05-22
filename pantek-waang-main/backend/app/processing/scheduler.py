@@ -202,11 +202,17 @@ def start_scheduler() -> AsyncIOScheduler:
     # pipeline still protects against holiday firings.
     open_hh, open_mm = _parse_hhmm(settings.rth_open_time, (9, 30))
     close_hh, close_mm = _parse_hhmm(settings.rth_close_time, (16, 15))
-    # Fire 1 minute before open / 1 minute after close.
+    # Fire 1 minute before open / 1 minute after close. The hour offsets
+    # wrap around midnight — e.g. RTH_OPEN_TIME=00:00 produces the
+    # pre-open hook at 23:59 the day before. A midnight session is exotic
+    # (the scheduler still applies day_of_week='mon-fri', so the hook
+    # fires on Friday-night → Saturday-morning configurations and may
+    # need recalibration); the wrap simply prevents an APScheduler
+    # CronTrigger validation crash on edge configs.
     pre_open_mm = (open_mm - 1) % 60
-    pre_open_hh = open_hh - (1 if open_mm == 0 else 0)
+    pre_open_hh = (open_hh - (1 if open_mm == 0 else 0)) % 24
     post_close_mm = (close_mm + 1) % 60
-    post_close_hh = close_hh + (1 if close_mm == 59 else 0)
+    post_close_hh = (close_hh + (1 if close_mm == 59 else 0)) % 24
 
     scheduler.add_job(
         _on_session_open,

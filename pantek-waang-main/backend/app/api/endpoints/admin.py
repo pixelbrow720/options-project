@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 from uuid import UUID
@@ -78,11 +79,13 @@ async def admin_login(payload: AdminLoginRequest) -> AdminLoginResponse:
     #   1) a plaintext value matching ADMIN_PASSWORD, or
     #   2) a bcrypt-hashed value matching the admin password (for prod).
     is_hash = settings.admin_password.startswith("$2")
-    valid = (
-        verify_password(payload.password, settings.admin_password)
-        if is_hash
-        else payload.password == settings.admin_password
-    )
+    if is_hash:
+        valid = verify_password(payload.password, settings.admin_password)
+    else:
+        valid = hmac.compare_digest(
+            payload.password.encode("utf-8"),
+            settings.admin_password.encode("utf-8"),
+        )
     if not valid:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
@@ -443,7 +446,7 @@ async def test_databento_key(
     if row is None:
         raise HTTPException(status_code=404, detail="Databento key not found")
     try:
-        plaintext = decrypt_secret(row.api_key_encrypted)
+        decrypt_secret(row.api_key_encrypted)
     except Exception as exc:  # noqa: BLE001
         return DatabentoKeyTestResult(
             ok=False,
@@ -454,7 +457,7 @@ async def test_databento_key(
     return DatabentoKeyTestResult(
         ok=True,
         message=(
-            f"Stored key decrypts cleanly ({mask_prefix(plaintext, chars=6)}…). "
+            "Stored key decrypts cleanly. "
             "Live verification is performed by the ingester on the next connect."
         ),
     )
@@ -553,7 +556,11 @@ async def approve_access_request(
                 status_code=404, detail="Provided api_key_id not found"
             )
     else:
-        symbols = payload.allowed_symbols or ["SPXW", "NDXP"]
+        symbols = (
+            payload.allowed_symbols
+            if payload.allowed_symbols is not None
+            else ["SPXW", "NDXP"]
+        )
         plaintext = generate_api_key()
         api_key = ApiKey(
             key_hash=hash_api_key(plaintext),

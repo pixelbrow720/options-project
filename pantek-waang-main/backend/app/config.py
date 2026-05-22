@@ -148,6 +148,13 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = Field(default=120, alias="RATE_LIMIT_PER_MINUTE")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
+    trust_proxy_headers: bool = Field(default=False, alias="TRUST_PROXY_HEADERS")
+    """When True, the rate limiter and audit logging treat the first
+    ``X-Forwarded-For`` entry as the real client IP. Only enable this
+    behind a trusted reverse proxy (Cloudflare, an in-cluster ingress)
+    that strips client-supplied ``X-Forwarded-For`` headers — otherwise
+    a client can spoof their IP and bypass per-IP rate limits."""
+
     # ── Rev 5: public site / Discord OAuth ────────────────────────────────
     discord_client_id: str = Field(default="", alias="DISCORD_CLIENT_ID")
     discord_client_secret: str = Field(default="", alias="DISCORD_CLIENT_SECRET")

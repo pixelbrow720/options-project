@@ -1,5 +1,9 @@
 import axios, { type AxiosInstance, type InternalAxiosRequestConfig } from "axios";
 
+// `__API_BASE__` lets ops set the API origin at runtime without a rebuild —
+// inject via `<script>window.__API_BASE__ = "..."</script>` in index.html
+// before the bundle is loaded, or via a docker entrypoint that templates the
+// HTML. Falls back to the build-time VITE_API_BASE_URL, then localhost dev.
 const baseURL =
   (typeof window !== "undefined" && (window as unknown as { __API_BASE__?: string }).__API_BASE__) ||
   import.meta.env.VITE_API_BASE_URL ||
@@ -30,10 +34,15 @@ api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
   return config;
 });
 
+// Module-level flag prevents N concurrent failing requests from each kicking
+// off their own redirect to /login (would otherwise cause a redirect loop /
+// flicker). Reset implicitly by the page reload.
+let _redirecting = false;
 api.interceptors.response.use(
   (response) => response,
   (error) => {
-    if (error?.response?.status === 401) {
+    if (error?.response?.status === 401 && !_redirecting) {
+      _redirecting = true;
       setStoredToken(null);
       if (typeof window !== "undefined" && window.location.pathname !== "/login") {
         window.location.href = "/login";
@@ -315,8 +324,8 @@ export interface InspectorPayload {
 }
 
 export const Inspector = {
-  async load(): Promise<InspectorPayload> {
-    const resp = await api.get("/admin/inspector");
+  async load(signal?: AbortSignal): Promise<InspectorPayload> {
+    const resp = await api.get("/admin/inspector", { signal });
     return resp.data;
   },
 };

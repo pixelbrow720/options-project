@@ -50,6 +50,11 @@ class OptionsChainWriter:
             max_pending_rows or settings.ingestion_max_pending_rows
         )
         self._lock = asyncio.Lock()
+        # Separate flush lock — held for the duration of a flush operation
+        # so concurrent ``add()`` calls can append to the buffer while a
+        # flush is mid-roundtrip, without two flushes racing each other.
+        self._flush_lock = asyncio.Lock()
+        self._flushing: bool = False
         self._last_flush_ts = datetime.utcnow()
         self._last_event_ts: datetime | None = None
         self._row_counts: dict[str, int] = {}
@@ -74,7 +79,8 @@ class OptionsChainWriter:
 
     async def add(self, row: dict[str, Any]) -> None:
         async with self._lock:
-            if len(self._buffer) >= self._max_pending_rows:
+            overflow = len(self._buffer) >= self._max_pending_rows
+            if overflow:
                 self._shed_rows += 1
                 shed = True
             else:
@@ -85,6 +91,12 @@ class OptionsChainWriter:
                 if symbol:
                     self._row_counts[symbol] = self._row_counts.get(symbol, 0) + 1
             should_flush = len(self._buffer) >= self._batch_size
+            should_kick_flush = overflow and not self._flushing
+        if overflow and should_kick_flush:
+            # Backpressure: kick a flush in the background BEFORE shedding so
+            # the buffer drains and the next ``add()`` has a chance to land.
+            # Guarded by ``_flushing`` to avoid stampede.
+            asyncio.create_task(self.flush())
         if shed:
             await record_dlq(
                 source="opra_live",
@@ -100,68 +112,77 @@ class OptionsChainWriter:
             await self.add(r)
 
     async def flush(self) -> int:
-        async with self._lock:
-            if not self._buffer:
-                return 0
-            batch = self._buffer
-            self._buffer = []
-            self._last_flush_ts = datetime.utcnow()
-
-        # Deduplicate by primary-key tuple. Live trades on the same contract
-        # frequently share a microsecond timestamp, which would cause Postgres
-        # to raise ``ON CONFLICT DO UPDATE command cannot affect row a second
-        # time`` (CardinalityViolationError). Last write wins per key.
-        deduped: dict[tuple, dict[str, Any]] = {}
-        for row in batch:
-            key = (
-                row.get("ts"),
-                row.get("symbol"),
-                row.get("expiration"),
-                row.get("strike"),
-                row.get("option_type"),
-            )
-            existing = deduped.get(key)
-            if existing is None:
-                deduped[key] = row
-                continue
-            # Merge: prefer non-null values from the newer row.
-            for k, v in row.items():
-                if v is not None:
-                    existing[k] = v
-        batch = list(deduped.values())
-
-        factory = get_session_factory()
-        async with factory() as session:
-            stmt = insert(OptionsChain).values(batch)
-            stmt = stmt.on_conflict_do_update(
-                index_elements=["ts", "symbol", "expiration", "strike", "option_type"],
-                set_={
-                    "oi": stmt.excluded.oi,
-                    "volume": stmt.excluded.volume,
-                    "iv": stmt.excluded.iv,
-                    "delta": stmt.excluded.delta,
-                    "gamma": stmt.excluded.gamma,
-                    "last_price": stmt.excluded.last_price,
-                    "bid": stmt.excluded.bid,
-                    "ask": stmt.excluded.ask,
-                    "underlying_price": stmt.excluded.underlying_price,
-                },
-            )
+        # Hold the flush_lock for the entire SQL roundtrip so two concurrent
+        # callers can't issue overlapping upsert batches against the same
+        # rows. The buffer-swap is still done under ``_lock`` so ``add()``
+        # remains non-blocking during the SQL roundtrip.
+        async with self._flush_lock:
+            self._flushing = True
             try:
-                await session.execute(stmt)
-                await session.commit()
-            except Exception as exc:  # noqa: BLE001
-                await session.rollback()
-                logger.exception("options_chain_write_failed", rows=len(batch))
-                await record_dlq(
-                    source="opra_live",
-                    reason=f"flush_failed: {type(exc).__name__}",
-                    payload={"row_count": len(batch), "error": str(exc)[:500]},
-                )
-                return 0
+                async with self._lock:
+                    if not self._buffer:
+                        return 0
+                    batch = self._buffer
+                    self._buffer = []
+                    self._last_flush_ts = datetime.utcnow()
 
-        logger.info("options_chain_flushed", rows=len(batch))
-        return len(batch)
+                # Deduplicate by primary-key tuple. Live trades on the same contract
+                # frequently share a microsecond timestamp, which would cause Postgres
+                # to raise ``ON CONFLICT DO UPDATE command cannot affect row a second
+                # time`` (CardinalityViolationError). Last write wins per key.
+                deduped: dict[tuple, dict[str, Any]] = {}
+                for row in batch:
+                    key = (
+                        row.get("ts"),
+                        row.get("symbol"),
+                        row.get("expiration"),
+                        row.get("strike"),
+                        row.get("option_type"),
+                    )
+                    existing = deduped.get(key)
+                    if existing is None:
+                        deduped[key] = row
+                        continue
+                    # Merge: prefer non-null values from the newer row.
+                    for k, v in row.items():
+                        if v is not None:
+                            existing[k] = v
+                batch = list(deduped.values())
+
+                factory = get_session_factory()
+                async with factory() as session:
+                    stmt = insert(OptionsChain).values(batch)
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=["ts", "symbol", "expiration", "strike", "option_type"],
+                        set_={
+                            "oi": stmt.excluded.oi,
+                            "volume": stmt.excluded.volume,
+                            "iv": stmt.excluded.iv,
+                            "delta": stmt.excluded.delta,
+                            "gamma": stmt.excluded.gamma,
+                            "last_price": stmt.excluded.last_price,
+                            "bid": stmt.excluded.bid,
+                            "ask": stmt.excluded.ask,
+                            "underlying_price": stmt.excluded.underlying_price,
+                        },
+                    )
+                    try:
+                        await session.execute(stmt)
+                        await session.commit()
+                    except Exception as exc:  # noqa: BLE001
+                        await session.rollback()
+                        logger.exception("options_chain_write_failed", rows=len(batch))
+                        await record_dlq(
+                            source="opra_live",
+                            reason=f"flush_failed: {type(exc).__name__}",
+                            payload={"row_count": len(batch), "error": str(exc)[:500]},
+                        )
+                        return 0
+
+                logger.info("options_chain_flushed", rows=len(batch))
+                return len(batch)
+            finally:
+                self._flushing = False
 
     async def periodic_flush_loop(self) -> None:
         while True:
@@ -172,8 +193,11 @@ class OptionsChainWriter:
                 logger.exception("periodic_flush_error")
 
 
-_writer = OptionsChainWriter()
+_writer: OptionsChainWriter | None = None
 
 
 def get_writer() -> OptionsChainWriter:
+    global _writer
+    if _writer is None:
+        _writer = OptionsChainWriter()
     return _writer

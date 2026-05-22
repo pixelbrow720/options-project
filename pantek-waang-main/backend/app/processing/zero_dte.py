@@ -25,11 +25,17 @@ import numpy as np
 import pandas as pd
 
 from app.core.logging import get_logger
+from app.processing import bsm
 from app.processing.gex import GexSummary, compute_gex
-from app.processing.session import time_to_expiry_0dte_years
+from app.processing.session import _now_eastern, time_to_expiry_0dte_years
 from app.processing.vanna_charm import GreekSummary, compute_charm
 
 logger = get_logger(__name__)
+
+
+def _today_eastern() -> date:
+    """Today's calendar date in America/New_York (DST-aware)."""
+    return _now_eastern().date()
 
 
 @dataclass
@@ -87,7 +93,7 @@ def split_by_expiry(
     if df.empty or "expiration" not in df.columns:
         return df.iloc[0:0].copy(), df.copy()
     if today is None:
-        today = pd.Timestamp.utcnow().tz_localize(None).date()
+        today = _today_eastern()
 
     work = df.copy()
     work["_expiry_date"] = work["expiration"].map(_to_date)
@@ -107,12 +113,17 @@ def compute_charm_decay_rate(
     *,
     atm_band_pct: float = 0.005,
     tau_years: float | None = None,
+    risk_free_rate: float = 0.05,
 ) -> float:
-    """Annualized charm scaled to a per-hour delta-decay rate.
+    """Per-hour |Δ-decay| across ATM 0DTE rows, expressed as a fraction.
 
-    Methodology: charm is ∂Δ/∂τ in BSM. To express it as a per-hour
-    quantity we divide by ``365 * 24`` hours per year. We restrict to
-    ATM rows (within ``atm_band_pct`` of spot) because that's where the
+    Computes BSM charm in-line (the upstream feed never populates a
+    ``charm`` column) and then aggregates the absolute value across rows
+    within ``atm_band_pct`` of spot. Charm from :mod:`app.processing.bsm`
+    is per-year, so we divide by ``365 * 24`` to land on a per-hour rate
+    (e.g. 0.012 = 1.2 %/hr of delta lost to time).
+
+    Methodology: only ATM rows contribute because that's where the
     pinning pressure lives — far OTM/ITM 0DTE charm is dominated by
     boundary effects that aren't actionable.
 
@@ -120,7 +131,7 @@ def compute_charm_decay_rate(
     """
     if zero_dte_df.empty:
         return 0.0
-    needed = {"strike", "underlying_price", "charm"}
+    needed = {"strike", "underlying_price", "iv", "option_type"}
     if not needed.issubset(zero_dte_df.columns):
         return 0.0
 
@@ -132,19 +143,35 @@ def compute_charm_decay_rate(
         return 0.0
 
     band = spot * atm_band_pct
-    strikes = pd.to_numeric(zero_dte_df["strike"], errors="coerce")
-    near_atm = (strikes - spot).abs() <= band
-    sub = zero_dte_df.loc[near_atm]
+    strikes_all = pd.to_numeric(zero_dte_df["strike"], errors="coerce")
+    near_atm = (strikes_all - spot).abs() <= band
+    sub = zero_dte_df.loc[near_atm].copy()
     if sub.empty:
         return 0.0
 
-    charm = pd.to_numeric(sub["charm"], errors="coerce").to_numpy(dtype=float)
-    charm = charm[np.isfinite(charm)]
-    if charm.size == 0:
+    sub["iv"] = pd.to_numeric(sub["iv"], errors="coerce")
+    sub["strike"] = pd.to_numeric(sub["strike"], errors="coerce")
+    sub = sub[sub["iv"].notna() & (sub["iv"] > 0) & sub["strike"].notna() & (sub["strike"] > 0)]
+    if sub.empty:
+        return 0.0
+
+    tau = float(tau_years) if tau_years is not None else time_to_expiry_0dte_years()
+    tau = max(1.0 / 365.0, tau)
+
+    K = sub["strike"].to_numpy(dtype=float)
+    sigma = sub["iv"].to_numpy(dtype=float)
+    is_call = sub["option_type"].astype(str).str.upper().to_numpy() == "C"
+    charm_arr = bsm.charm(
+        spot, K, tau, sigma, r=risk_free_rate,
+        option_type=np.where(is_call, "C", "P"),
+    )
+    charm_arr = np.asarray(charm_arr, dtype=float)
+    charm_arr = charm_arr[np.isfinite(charm_arr)]
+    if charm_arr.size == 0:
         return 0.0
 
     HOURS_PER_YEAR = 365.0 * 24.0
-    return float(np.mean(np.abs(charm)) / HOURS_PER_YEAR)
+    return float(np.mean(np.abs(charm_arr)) / HOURS_PER_YEAR)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -168,6 +195,10 @@ def compute_flip_speed(
     if net_gex_prev is None or not np.isfinite(net_gex_prev):
         return 0.0
     if not np.isfinite(net_gex_now) or not np.isfinite(elapsed_seconds):
+        return 0.0
+    if elapsed_seconds < 0:
+        # Clock rewind (NTP step / DST glitch) — treat as no-op so we don't
+        # report a fictitious flip from a negative dt.
         return 0.0
     if elapsed_seconds <= 0.5:  # noise floor
         return 0.0
@@ -243,7 +274,10 @@ def compute_zero_dte_summary(
         zero, weight_col="oi", risk_free_rate=risk_free_rate
     )
     charm_decay = compute_charm_decay_rate(
-        zero, atm_band_pct=atm_band_pct, tau_years=tau
+        zero,
+        atm_band_pct=atm_band_pct,
+        tau_years=tau,
+        risk_free_rate=risk_free_rate,
     )
     flip = 0.0
     if (

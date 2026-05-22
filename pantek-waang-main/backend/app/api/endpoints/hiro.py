@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pandas as pd
-from fastapi import APIRouter, Depends, Path, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,7 +25,7 @@ from app.db.session import get_db
 router = APIRouter()
 
 
-_SYMBOL_PATTERN = r"^[A-Za-z0-9_.-]+$"
+_SYMBOL_PATTERN = r"^[A-Z][A-Z0-9]{0,11}$"
 
 _BUCKET_TO_PANDAS = {"1m": "1min", "5m": "5min", "15m": "15min"}
 
@@ -95,10 +95,20 @@ async def get_hiro(
     """
     sym_u = symbol.upper()
     target_bucket = _BUCKET_TO_PANDAS[bucket]
+    now = datetime.now(UTC)
     if since is None:
-        since = datetime.now(UTC) - timedelta(hours=1)
+        since = now - timedelta(hours=1)
     elif since.tzinfo is None:
         since = since.replace(tzinfo=UTC)
+
+    # Bound ``since`` to a sane window — values outside this range are
+    # almost always a client bug (clock skew, year-2038 overflow) and
+    # the persisted HIRO buffer never extends further back than 24h.
+    if since < now - timedelta(hours=24) or since > now:
+        raise HTTPException(
+            status_code=400,
+            detail="since must be within the last 24 hours and not in the future",
+        )
 
     latest_q = (
         select(ComputedMetric)

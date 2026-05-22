@@ -64,6 +64,10 @@ class BulkUpsertWriter:
         self._dlq_source = dlq_source
         self._buffer: list[dict[str, Any]] = []
         self._lock = asyncio.Lock()
+        # Separate flush lock — held for the entire SQL roundtrip so two
+        # concurrent flushes can't issue overlapping upserts.
+        self._flush_lock = asyncio.Lock()
+        self._flushing: bool = False
         self._last_flush_ts: datetime = datetime.utcnow()
         self._shed_rows = 0
 
@@ -77,13 +81,19 @@ class BulkUpsertWriter:
 
     async def add(self, row: dict[str, Any]) -> None:
         async with self._lock:
-            if len(self._buffer) >= self._max_pending_rows:
+            overflow = len(self._buffer) >= self._max_pending_rows
+            if overflow:
                 self._shed_rows += 1
                 shed = True
             else:
                 shed = False
                 self._buffer.append(row)
             should_flush = len(self._buffer) >= self._batch_size
+            should_kick_flush = overflow and not self._flushing
+        if overflow and should_kick_flush:
+            # Backpressure: kick a flush before shedding so the buffer
+            # drains and subsequent ``add()`` calls have a chance to land.
+            asyncio.create_task(self.flush())
         if shed:
             await record_dlq(
                 source=self._dlq_source,
@@ -99,20 +109,25 @@ class BulkUpsertWriter:
             await self.add(r)
 
     async def flush(self) -> int:
-        async with self._lock:
-            if not self._buffer:
-                return 0
-            batch = self._buffer
-            self._buffer = []
-            self._last_flush_ts = datetime.utcnow()
+        async with self._flush_lock:
+            self._flushing = True
+            try:
+                async with self._lock:
+                    if not self._buffer:
+                        return 0
+                    batch = self._buffer
+                    self._buffer = []
+                    self._last_flush_ts = datetime.utcnow()
 
-        if self.conflict_keys:
-            batch = self._dedupe_by(batch, self.conflict_keys)
+                if self.conflict_keys:
+                    batch = self._dedupe_by(batch, self.conflict_keys)
 
-        factory = get_session_factory()
-        async with factory() as session:
-            await self._do_insert(session, batch)
-        return len(batch)
+                factory = get_session_factory()
+                async with factory() as session:
+                    await self._do_insert(session, batch)
+                return len(batch)
+            finally:
+                self._flushing = False
 
     async def _do_insert(self, session: AsyncSession, batch: list[dict]) -> None:
         if not batch:

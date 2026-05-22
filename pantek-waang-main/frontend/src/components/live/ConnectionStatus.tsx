@@ -7,6 +7,7 @@ const LABELS: Record<Status, string> = {
   reconnecting: "Reconnecting",
   closed: "Disconnected",
   error: "Error",
+  "auth-failed": "Auth failed — re-enter API key",
 };
 
 function colorFor(status: Status): string {
@@ -16,6 +17,7 @@ function colorFor(status: Status): string {
     case "connecting":
     case "reconnecting":
       return "bg-amber-400";
+    case "auth-failed":
     case "error":
     case "closed":
     default:

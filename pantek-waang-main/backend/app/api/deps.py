@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+import threading
 import uuid
+from collections import defaultdict, deque
 from datetime import UTC, datetime
+from time import monotonic
 from typing import Annotated
 
 import jwt
@@ -28,11 +31,32 @@ from app.db.session import get_db
 # ── Rate limiter ─────────────────────────────────────────────────────────────
 
 
+def _real_client_ip(request: Request) -> str:
+    """Resolve the real client IP, optionally trusting reverse-proxy headers.
+
+    When ``settings.trust_proxy_headers`` is False (default), this falls
+    back to slowapi's ``get_remote_address`` which inspects only the
+    socket peer. When True, the first comma-separated entry in
+    ``X-Forwarded-For`` is preferred — that's the originating client
+    when a trusted edge (Cloudflare / ingress) prepends to the header.
+    Only enable when the front proxy strips client-supplied values,
+    otherwise a remote client can spoof their IP.
+    """
+    settings = get_settings()
+    if settings.trust_proxy_headers:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            first = forwarded.split(",", 1)[0].strip()
+            if first:
+                return first
+    return get_remote_address(request)
+
+
 def _api_key_or_ip(request: Request) -> str:
     api_key = request.headers.get("X-API-Key") or request.headers.get("x-api-key")
     if api_key:
         return f"key:{api_key[:11]}"
-    return f"ip:{get_remote_address(request)}"
+    return f"ip:{_real_client_ip(request)}"
 
 
 def _limiter_enabled() -> bool:
@@ -66,10 +90,6 @@ limiter = Limiter(key_func=_api_key_or_ip, enabled=_limiter_enabled())
 # This sits in front of the route, so FastAPI's signature inspection only
 # ever sees the route's own globals.
 
-import threading
-from collections import defaultdict, deque
-from time import monotonic
-
 
 class _SlidingWindowLimiter:
     """O(N) per-key sliding window. N = limit (small). Thread-safe."""
@@ -94,7 +114,7 @@ class _SlidingWindowLimiter:
 _simple_limiter = _SlidingWindowLimiter()
 
 
-def rate_limit(limit: int, period_seconds: int = 60, *, key: str = "") -> "callable":
+def rate_limit(limit: int, period_seconds: int = 60, *, key: str = "") -> callable:
     """Build a FastAPI dependency that enforces a per-IP rate limit.
 
     Usage::
@@ -108,7 +128,7 @@ def rate_limit(limit: int, period_seconds: int = 60, *, key: str = "") -> "calla
     async def _dep(request: Request) -> None:
         if not _limiter_enabled():
             return
-        ip = get_remote_address(request)
+        ip = _real_client_ip(request)
         bucket_key = f"{key}:{ip}"
         if not _simple_limiter.allow(bucket_key, limit, period_seconds):
             raise HTTPException(

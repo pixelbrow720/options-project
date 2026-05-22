@@ -29,7 +29,6 @@ from typing import Any
 
 from app.processing.spot import _FUTURES_ROOT_FOR_SYMBOL
 
-
 # ──────────────────────────────────────────────────────────────────────────
 # Public types
 # ──────────────────────────────────────────────────────────────────────────

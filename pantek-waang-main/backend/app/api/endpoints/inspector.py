@@ -21,7 +21,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import desc, func, select
+from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import authenticate_admin
@@ -133,25 +133,61 @@ async def data_inspector(
     ]
 
     # ── 3. Latest snapshot per key metric_type ────────────────────────────
+    # One batched query per symbol pulls the latest row for every metric
+    # in ``_LATEST_METRIC_TYPES`` in two round-trips total instead of
+    # ``len(symbols) * len(metric_types)``. The pattern mirrors
+    # ``_latest_metrics_batch`` in ``data.py`` but with a tighter result
+    # shape (one row per (metric_type, symbol)).
     latest_metrics: list[dict[str, Any]] = []
-    for metric_type in _LATEST_METRIC_TYPES:
-        # one row per (symbol, metric_type) — most recent ts.
-        for symbol in settings.supported_symbols:
-            row = (
-                await session.execute(
-                    select(ComputedMetric)
-                    .where(
-                        ComputedMetric.metric_type == metric_type,
-                        ComputedMetric.symbol == symbol,
-                    )
-                    .order_by(desc(ComputedMetric.ts))
-                    .limit(1)
+    for symbol in settings.supported_symbols:
+        ts_rows = (
+            await session.execute(
+                select(
+                    ComputedMetric.metric_type,
+                    func.max(ComputedMetric.ts).label("max_ts"),
                 )
-            ).scalar_one_or_none()
-            if row is None:
+                .where(
+                    ComputedMetric.symbol == symbol,
+                    ComputedMetric.metric_type.in_(_LATEST_METRIC_TYPES),
+                )
+                .group_by(ComputedMetric.metric_type)
+            )
+        ).all()
+        latest_ts_by_type: dict[str, datetime] = {
+            row.metric_type: row.max_ts
+            for row in ts_rows
+            if row.max_ts is not None
+        }
+        if not latest_ts_by_type:
+            continue
+        # Pick a deterministic representative row per (metric_type, ts).
+        # Several metric_types persist multiple rows at the same ts (one
+        # per strike / expiration); the legacy code took the first one
+        # the DB returned, so we order by metric_type for stability and
+        # let row_number()/limit semantics in Python pick the first
+        # encountered row.
+        conds = [
+            and_(
+                ComputedMetric.metric_type == mt,
+                ComputedMetric.ts == ts,
+            )
+            for mt, ts in latest_ts_by_type.items()
+        ]
+        rows_q = (
+            select(ComputedMetric)
+            .where(
+                ComputedMetric.symbol == symbol,
+                or_(*conds),
+            )
+            .order_by(ComputedMetric.metric_type, desc(ComputedMetric.value))
+        )
+        seen_metric_types: set[str] = set()
+        for row in (await session.execute(rows_q)).scalars().all():
+            if row.metric_type in seen_metric_types:
                 continue
+            seen_metric_types.add(row.metric_type)
             latest_metrics.append({
-                "metric_type": metric_type,
+                "metric_type": row.metric_type,
                 "symbol": row.symbol,
                 "ts": row.ts.isoformat() if row.ts else None,
                 "lag_seconds": _lag_seconds(row.ts),

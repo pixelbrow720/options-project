@@ -11,6 +11,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Status } from "@/lib/api";
 import { LiveSnapshotProvider, useLiveSnapshot } from "@/lib/streamClient";
+import { formatTimeET } from "@/lib/utils";
+
+// Mirror backend `_SYMBOL_PATTERN` (^[A-Z][A-Z0-9]{0,11}$) so the user gets
+// immediate feedback before we dispatch a doomed connection attempt.
+const SYMBOL_PATTERN = /^[A-Z][A-Z0-9]{0,11}$/;
 
 function LiveDashboardInner() {
   const { symbol, apiKey, setSymbol, setApiKey, snapshot, status, lastFrameAt } =
@@ -18,6 +23,7 @@ function LiveDashboardInner() {
   const [supportedSymbols, setSupportedSymbols] = useState<string[]>([]);
   const [draftSymbol, setDraftSymbol] = useState<string>(symbol);
   const [draftKey, setDraftKey] = useState<string>(apiKey);
+  const [symbolError, setSymbolError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -34,39 +40,20 @@ function LiveDashboardInner() {
   }, []);
 
   const data = snapshot?.data;
-  // Rev 4 fields aren't typed in lib/streamClient yet — accessed via a
-  // narrow shape projection here so the existing typed props on
-  // {GexChart, HiroPanel, WallsCards, FlowFeed, RegimeBadge} keep working.
-  const revFour = (snapshot?.data ?? {}) as {
-    session_state?: {
-      is_rth: boolean;
-      session_open: string | null;
-      session_close: string | null;
-      minutes_to_close: number | null;
-      tau_0dte_years: number | null;
-      is_expiration_day: boolean;
-      symbol?: string;
-    };
-    spot?: {
-      price: number;
-      source: string;
-      futures_price?: number | null;
-      basis?: number | null;
-      basis_age_seconds?: number | null;
-      parity_deviation_pct?: number | null;
-    };
-    zero_dte?: {
-      gex_oi?: { net_total: number };
-      gex_volume?: { net_total: number };
-      charm_total?: { net_total: number };
-      charm_decay_rate?: number;
-      flip_speed?: number;
-    };
-  };
+  const sess = data?.session_state;
+  const spot = data?.spot;
+  const zdte = data?.zero_dte;
 
-  const sess = revFour.session_state;
-  const spot = revFour.spot;
-  const zdte = revFour.zero_dte;
+  function onConnect() {
+    const candidate = draftSymbol.trim().toUpperCase();
+    if (!SYMBOL_PATTERN.test(candidate)) {
+      setSymbolError("Invalid symbol. Must start with a letter, A-Z0-9 only, max 12 chars.");
+      return;
+    }
+    setSymbolError(null);
+    setSymbol(candidate);
+    setApiKey(draftKey);
+  }
 
   return (
     <div className="space-y-6">
@@ -86,7 +73,7 @@ function LiveDashboardInner() {
             {snapshot?.computed_at && (
               <>
                 {" "}
-                · last frame {new Date(snapshot.computed_at).toLocaleTimeString()}
+                · last frame {formatTimeET(snapshot.computed_at)}
               </>
             )}
           </p>
@@ -121,7 +108,7 @@ function LiveDashboardInner() {
           </div>
           {spot && (
             <div className="text-xs text-muted-foreground">
-              source: <span className="font-mono">{spot.source}</span>
+              source: <span className="font-mono">{spot.source ?? "—"}</span>
               {spot.basis !== null && spot.basis !== undefined && (
                 <> · basis {spot.basis.toFixed(2)}</>
               )}
@@ -152,13 +139,19 @@ function LiveDashboardInner() {
               className="mt-1 font-mono"
               value={draftSymbol}
               placeholder="SPXW"
-              onChange={(e) => setDraftSymbol(e.target.value.toUpperCase())}
+              onChange={(e) => {
+                setDraftSymbol(e.target.value.toUpperCase());
+                if (symbolError) setSymbolError(null);
+              }}
             />
             <datalist id="symbol-list">
               {supportedSymbols.map((s) => (
                 <option key={s} value={s} />
               ))}
             </datalist>
+            {symbolError && (
+              <p className="mt-1 text-xs text-destructive">{symbolError}</p>
+            )}
           </div>
           <div>
             <Label htmlFor="api-key">API key</Label>
@@ -172,13 +165,7 @@ function LiveDashboardInner() {
             />
           </div>
           <div className="flex gap-2">
-            <Button
-              onClick={() => {
-                setSymbol(draftSymbol);
-                setApiKey(draftKey);
-              }}
-              className="gap-2"
-            >
+            <Button onClick={onConnect} className="gap-2">
               <Activity className="h-4 w-4" />
               Connect
             </Button>
@@ -190,6 +177,7 @@ function LiveDashboardInner() {
                   setApiKey("");
                   setDraftSymbol("");
                   setDraftKey("");
+                  setSymbolError(null);
                 }}
               >
                 Disconnect

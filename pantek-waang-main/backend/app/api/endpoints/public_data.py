@@ -50,11 +50,14 @@ from app.api.deps import require_user_symbol_access
 from app.api.endpoints.snapshot import build_snapshot_payload
 from app.api.endpoints.stream import (
     HEARTBEAT_INTERVAL_SECONDS,
+    REVOCATION_CHECK_INTERVAL_SECONDS,
+    WS_REVOKED_CODE,
     _frame,
     _published_frame,
     _ws_release,
     _ws_try_register,
 )
+from app.api.endpoints.stream_ticket import get_ticket_store
 from app.api.schemas import DataEnvelope
 from app.api.stream_notifier import get_stream_notifier
 from app.api.tick_notifier import get_tick_notifier
@@ -85,7 +88,7 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/public", tags=["public-data"])
 
-_SYMBOL_PATTERN = r"^[A-Za-z0-9_.-]+$"
+_SYMBOL_PATTERN = r"^[A-Z][A-Z0-9]{0,11}$"
 
 # Public data endpoints serve read-only computed metrics that the
 # pipeline refreshes every ``compute_interval_seconds`` (default 60s).
@@ -1920,19 +1923,63 @@ async def public_stream_ws(
     websocket: WebSocket,
     symbol: str = Path(..., min_length=1, max_length=20, pattern=_SYMBOL_PATTERN),
     token: str | None = Query(default=None),
+    ticket: str | None = Query(default=None),
 ) -> None:
     sym_u = symbol.upper()
-    if not token:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
-
     factory = get_session_factory()
-    async with factory() as session:
-        resolved = await _resolve_session_user(token, session)
-    if resolved is None:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
-    user, api_key = resolved
+    user: User | None = None
+    api_key: ApiKey | None = None
+    user_session_id: uuid.UUID | None = None
+
+    if ticket:
+        principal_id = get_ticket_store().consume(
+            ticket, kind="public_session", symbol=sym_u
+        )
+        if principal_id is not None:
+            try:
+                user_id = int(principal_id)
+            except (ValueError, TypeError):
+                user_id = None
+            if user_id is not None:
+                async with factory() as session:
+                    candidate_user = await session.get(User, user_id)
+                    if (
+                        candidate_user is not None
+                        and candidate_user.status == "approved"
+                        and candidate_user.api_key_id is not None
+                    ):
+                        candidate_key = await session.get(
+                            ApiKey, candidate_user.api_key_id
+                        )
+                        if candidate_key is not None and candidate_key.is_active:
+                            user = candidate_user
+                            api_key = candidate_key
+
+    if user is None or api_key is None:
+        if not token:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        logger.warning(
+            "public_stream_ws_legacy_token_query_param",
+            symbol=sym_u,
+            detail="Client used deprecated ?token= query param; migrate to ?ticket=",
+        )
+        async with factory() as session:
+            resolved = await _resolve_session_user(token, session)
+        if resolved is None:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        user, api_key = resolved
+        # Capture sid from the JWT for mid-stream revocation checks. The
+        # session has already been validated above; we just decode again
+        # to extract the sid without rerunning the full pipeline.
+        try:
+            jwt_payload = decode_public_session_token(token)
+            sid_raw = jwt_payload.get("sid")
+            if sid_raw is not None:
+                user_session_id = uuid.UUID(str(sid_raw))
+        except (jwt.InvalidTokenError, ValueError, TypeError, Exception):  # noqa: BLE001
+            user_session_id = None
 
     if sym_u not in [s.upper() for s in (api_key.allowed_symbols or [])]:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
@@ -1947,9 +1994,21 @@ async def public_stream_ws(
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    await websocket.accept()
     notifier = get_stream_notifier()
-    queue = notifier.subscribe(sym_u)
+    try:
+        queue = notifier.subscribe(sym_u)
+    except Exception:  # noqa: BLE001
+        await _ws_release(api_key_id)
+        logger.exception("public_stream_ws_subscribe_failed", symbol=sym_u)
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    try:
+        await websocket.accept()
+    except Exception:  # noqa: BLE001
+        notifier.unsubscribe(sym_u, queue)
+        await _ws_release(api_key_id)
+        raise
 
     async def _send_json(payload: dict[str, Any]) -> None:
         await websocket.send_text(json.dumps(payload, default=str))
@@ -1971,10 +2030,51 @@ async def public_stream_ws(
         except (WebSocketDisconnect, RuntimeError, ConnectionError):
             return
 
+    async def _is_revoked() -> bool:
+        """Return True if the API key, user, or session was revoked."""
+        try:
+            async with factory() as s3:
+                fresh_key = await s3.get(ApiKey, api_key.id)
+                fresh_user = await s3.get(User, user.id)
+                fresh_session = (
+                    await s3.get(UserSession, user_session_id)
+                    if user_session_id is not None
+                    else None
+                )
+        except Exception:  # noqa: BLE001 - DB blip should not kick the client
+            logger.exception(
+                "public_stream_ws_revocation_check_failed", symbol=sym_u
+            )
+            return False
+        if fresh_key is None or not fresh_key.is_active:
+            return True
+        if fresh_key.expires_at is not None:
+            expires_at = fresh_key.expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            if expires_at < datetime.now(UTC):
+                return True
+        if fresh_user is None or fresh_user.status != "approved":
+            return True
+        if fresh_session is not None and fresh_session.revoked:
+            return True
+        return False
+
     async def _pump() -> None:
         try:
             while True:
-                payload = await queue.get()
+                try:
+                    payload = await asyncio.wait_for(
+                        queue.get(), timeout=REVOCATION_CHECK_INTERVAL_SECONDS
+                    )
+                except TimeoutError:
+                    if await _is_revoked():
+                        try:
+                            await websocket.close(code=WS_REVOKED_CODE)
+                        except (RuntimeError, ConnectionError):
+                            pass
+                        return
+                    continue
                 await _send_json(_published_frame(sym_u, payload))
         except (WebSocketDisconnect, RuntimeError, ConnectionError):
             return

@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, Path, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,7 +22,7 @@ from app.db.session import get_db
 router = APIRouter()
 
 
-_SYMBOL_PATTERN = r"^[A-Za-z0-9_.-]+$"
+_SYMBOL_PATTERN = r"^[A-Z][A-Z0-9]{0,11}$"
 _ALLOWED_EVENT_TYPES = {"SWEEP", "BLOCK", "UOA", "all"}
 
 
@@ -65,10 +65,20 @@ async def get_flow(
     if event_type_u not in _ALLOWED_EVENT_TYPES:
         return {"symbol": sym_u, "since": None, "event_type": event_type, "events": []}
 
+    now = datetime.now(UTC)
     if since is None:
-        since = datetime.now(UTC) - timedelta(hours=1)
+        since = now - timedelta(hours=1)
     elif since.tzinfo is None:
         since = since.replace(tzinfo=UTC)
+
+    # Bound ``since`` to a sane window — values outside this range are
+    # almost always a client bug (clock skew, year-2038 overflow) and
+    # would otherwise scan the entire FlowEvent table.
+    if since < now - timedelta(hours=24) or since > now:
+        raise HTTPException(
+            status_code=400,
+            detail="since must be within the last 24 hours and not in the future",
+        )
 
     stmt = (
         select(FlowEvent)

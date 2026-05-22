@@ -184,12 +184,38 @@ def upgrade() -> None:
             # ALTER TABLE … SET (timescaledb.compress, …) is idempotent
             # but errors if a non-existent column is referenced — segment
             # by symbol which all four tables have.
-            op.execute(
-                f"ALTER TABLE {table} SET ("
-                f"timescaledb.compress, "
-                f"timescaledb.compress_segmentby = '{segment_by}', "
-                f"timescaledb.compress_orderby = 'ts DESC');"
-            )
+            #
+            # ``options_chain`` already has compression configured by
+            # migration 0001 with ``compress_segmentby='symbol, option_type'``.
+            # TimescaleDB rejects a ``segmentby`` change once compressed
+            # chunks exist, so guard the SET on whether any compressed
+            # chunks have been produced. On a fresh cluster the SET applies;
+            # on a populated cluster the existing 0001 settings remain.
+            if table == "options_chain":
+                op.execute(
+                    """
+                    DO $$
+                    BEGIN
+                      IF NOT EXISTS (
+                        SELECT 1 FROM timescaledb_information.compressed_chunk_stats
+                        WHERE hypertable_name = 'options_chain'
+                      ) THEN
+                        ALTER TABLE options_chain SET (
+                          timescaledb.compress,
+                          timescaledb.compress_segmentby = 'symbol',
+                          timescaledb.compress_orderby = 'ts DESC'
+                        );
+                      END IF;
+                    END$$;
+                    """
+                )
+            else:
+                op.execute(
+                    f"ALTER TABLE {table} SET ("
+                    f"timescaledb.compress, "
+                    f"timescaledb.compress_segmentby = '{segment_by}', "
+                    f"timescaledb.compress_orderby = 'ts DESC');"
+                )
             # add_compression_policy supports if_not_exists since TimescaleDB 2.6.
             op.execute(
                 f"SELECT add_compression_policy('{table}', INTERVAL '1 day', "

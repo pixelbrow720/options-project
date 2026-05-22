@@ -16,7 +16,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { cn } from "@/lib/utils";
+import { cn, formatTimeET } from "@/lib/utils";
 import type { HiroPayload } from "@/lib/streamClient";
 
 function formatValue(value: number): string {
@@ -24,15 +24,6 @@ function formatValue(value: number): string {
   if (abs >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
   if (abs >= 1e3) return `${(value / 1e3).toFixed(1)}K`;
   return value.toFixed(0);
-}
-
-function formatTime(ts: string): string {
-  try {
-    const d = new Date(ts);
-    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  } catch {
-    return ts;
-  }
 }
 
 export interface HiroPanelProps {
@@ -86,7 +77,7 @@ export function HiroPanel({ payload }: HiroPanelProps) {
                 <CartesianGrid stroke="hsl(215 28% 17%)" strokeDasharray="3 3" />
                 <XAxis
                   dataKey="ts"
-                  tickFormatter={formatTime}
+                  tickFormatter={formatTimeET}
                   stroke="hsl(215 20% 65%)"
                   fontSize={11}
                   minTickGap={32}
@@ -103,7 +94,7 @@ export function HiroPanel({ payload }: HiroPanelProps) {
                     border: "1px solid hsl(215 28% 17%)",
                     fontSize: 12,
                   }}
-                  labelFormatter={(v) => formatTime(String(v))}
+                  labelFormatter={(v) => formatTimeET(String(v))}
                   formatter={(v: number) => [formatValue(Number(v)), "Cumulative"]}
                 />
                 <ReferenceLine y={0} stroke="hsl(215 20% 65%)" strokeDasharray="2 2" />

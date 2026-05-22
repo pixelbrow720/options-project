@@ -4,6 +4,30 @@
 
 :root {
   color-scheme: dark;
+
+  /* Surfaces — dark-first terminal aesthetic */
+  --bg-base: 225 22% 5%;            /* #0A0B0F */
+  --bg-elevated: 224 20% 9%;        /* #12141B */
+  --bg-card: 225 20% 12%;           /* #181B24 */
+  --border-token: 226 16% 17%;      /* #252834 */
+  --border-hover: 226 15% 25%;      /* #353948 */
+
+  /* Text */
+  --fg-primary: 214 7% 92%;         /* #E8EAED */
+  --fg-muted: 220 7% 57%;           /* #8A8F99 */
+  --fg-faint: 225 8% 36%;           /* #555863 */
+
+  /* Semantic — data-driven, not decorative */
+  --positive: 164 100% 43%;         /* #00D9A0 long gamma / bullish */
+  --negative: 351 100% 65%;         /* #FF4D6D short gamma / bearish */
+  --flip: 34 100% 64%;              /* #FFB547 zero-gamma / max pain */
+  --neutral: 220 9% 46%;            /* #6B7280 no-signal */
+
+  /* Brand */
+  --brand-primary: 220 92% 67%;     /* #5B8FF9 electric blue */
+  --brand-secondary: 252 95% 76%;   /* #A78BFA lavender */
+
+  --radius: 0.5rem;
 }
 
 body {
@@ -12,4 +36,9 @@ body {
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+/* Tabular numerics utility — handy for trading data */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
 }

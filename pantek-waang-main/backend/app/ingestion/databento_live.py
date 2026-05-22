@@ -21,18 +21,67 @@ Failure modes handled:
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.config import get_settings
 from app.core.logging import get_logger
+from app.db.session import get_session_factory
 from app.ingestion.bulk_writers import (
     BulkUpsertWriter,
     get_options_trade_writer,
 )
+from app.ingestion.key_pool import (
+    KeyCandidate,
+    iter_keys,
+    record_key_error,
+    record_key_success,
+)
 from app.ingestion.writer import OptionsChainWriter, get_writer
 
 logger = get_logger(__name__)
+
+# Allowlist of attribute names captured into ``sample_record_attrs`` for
+# diagnostics. ErrorMsg and SystemMsg frames may carry auth tokens / URLs
+# in other attrs; capturing ``dir(record)`` would leak those.
+_DIAGNOSTICS_ATTR_ALLOWLIST: frozenset[str] = frozenset({
+    "bid_px",
+    "ask_px",
+    "bid_sz",
+    "ask_sz",
+    "instrument_id",
+    "raw_symbol",
+    "ts_event",
+    "ts_recv",
+    "stat_type",
+    "quantity",
+    "value",
+    "price",
+    "size",
+    "aggressor_side",
+    "publisher_id",
+    "expiration",
+    "expiration_date",
+    "strike_price",
+    "instrument_class",
+    "option_type",
+    "msg",
+    "err",
+})
+
+# Maximum age of a cached NBBO quote (seconds) before we treat it as stale
+# in the inline quote-rule classifier. Beyond this we skip side / signed
+# premium rather than tagging a trade with a stale book.
+_QUOTE_MAX_AGE_S = 5.0
+
+# Auth-style error fragments that imply a schema-drop event but did not
+# match one of the explicit ``"<schema> not authorized"`` substrings.
+_AUTH_ERROR_FRAGMENTS: tuple[str, ...] = (
+    "unauthorized",
+    "forbidden",
+    "not authorized",
+    "not supported",
+)
 
 
 def pd_to_date(value: Any):
@@ -126,6 +175,16 @@ class DatabentoLiveIngester:
         # Captured gateway frames (SystemMsg / ErrorMsg). Most recent first.
         self._system_messages: list[str] = []
         self._error_messages: list[str] = []
+        # Terminal-failure flag — set after MAX_RECONNECTS or no schemas left.
+        # Manual recovery via ``reset_after_terminal()``.
+        self._dead: bool = False
+        # Counters surfaced via diagnostics for operator visibility.
+        self._dropped_no_ts_count: int = 0
+        self._unmatched_total: int = 0
+        self._last_unmatched_bootstrap_at: datetime | None = None
+        # Most recent KeyCandidate label that successfully connected — surfaced
+        # in diagnostics so operators can tell which key the live stream is on.
+        self._active_key_label: str | None = None
 
     # ── Diagnostics surface (read by /admin/inspector) ──────────────────────
     def diagnostics(self) -> dict[str, Any]:
@@ -153,11 +212,36 @@ class DatabentoLiveIngester:
             "supported_symbols": self._settings.supported_symbols,
             "writer_pending": self._writer.pending,
             "writer_shed_rows": self._writer.shed_rows,
+            "terminated": self._dead,
+            "attempts_remaining_until_terminal_reset": (
+                0 if self._dead
+                else max(0, MAX_RECONNECTS - self._connection_attempts)
+            ),
+            "dropped_no_ts_count": self._dropped_no_ts_count,
+            "unmatched_total": self._unmatched_total,
+            "active_key_label": self._active_key_label,
         }
+
+    def reset_after_terminal(self) -> None:
+        """Clear the terminal-failure flag so :meth:`start` can be called again.
+
+        Operators trigger this via the admin UI after registering / fixing
+        a Databento key. Auto-resume is intentionally out of scope: the
+        operator should restart the stream explicitly.
+        """
+        self._dead = False
+        self._connection_attempts = 0
+        self._last_error = None
 
     # ── Public API ──────────────────────────────────────────────────────────
     def start(self) -> None:
         if self._task is not None:
+            return
+        if self._dead:
+            logger.error(
+                "live_ingestion_start_blocked_terminal_state",
+                hint="call reset_after_terminal() before retrying",
+            )
             return
         self._task = asyncio.create_task(self._run_with_reconnect(), name="databento_live")
         self._registry_refresh_task = asyncio.create_task(
@@ -170,6 +254,8 @@ class DatabentoLiveIngester:
         Cancels the main stream task and the registry refresh task, then
         flushes any pending buffered rows so we don't lose in-flight data.
         """
+        if self._task is None:
+            return
         self._stop.set()
         tasks = [t for t in (self._task, self._registry_refresh_task) if t is not None]
         for task in tasks:
@@ -220,20 +306,12 @@ class DatabentoLiveIngester:
         if self._settings.disable_live_ingestion:
             logger.info("live_ingestion_disabled")
             return
-        if not self._settings.opra_api_key:
-            logger.warning("live_ingestion_skipped_no_api_key")
-            return
 
         try:
             import databento as db  # noqa: F401
         except ImportError:
             logger.warning("databento_import_failed_for_live")
             return
-
-        # Bootstrap the contract registry. The Live ``definition`` schema only
-        # emits records when contracts change, so without this we can't map any
-        # incoming trade/MBP/statistics records back to (strike, expiry, type).
-        await self._bootstrap_registry()
 
         backoff = INITIAL_BACKOFF_S
         attempt = 0
@@ -242,54 +320,165 @@ class DatabentoLiveIngester:
                 return
             attempt += 1
             self._connection_attempts = attempt
-            try:
-                logger.info(
-                    "live_ingestion_connecting", attempt=attempt, schemas=self._schemas
-                )
-                await self._stream_once()
-                # Clean exit (stream closed naturally) — try again with reset backoff.
-                backoff = INITIAL_BACKOFF_S
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                msg = str(exc)
-                self._last_error = msg[:500]
-                dropped = self._drop_unsupported_schema(msg)
-                if dropped:
-                    self._dropped_schemas.append(dropped)
-                    logger.warning(
-                        "live_dropping_unsupported_schema",
-                        dropped=dropped,
-                        remaining=self._schemas,
-                    )
-                    if not self._schemas:
-                        logger.error("live_ingestion_no_schemas_left")
-                        return
-                    # Don't burn an attempt for a config-time fix.
-                    attempt -= 1
-                    continue
-                logger.exception("live_ingestion_stream_failed", error=msg)
-                if attempt >= MAX_RECONNECTS:
-                    logger.error("live_ingestion_giving_up", attempts=attempt)
-                    return
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60.0)
 
-    async def _bootstrap_registry(self) -> None:
+            # Resolve the key candidate list at the *start* of every attempt
+            # so newly-registered DB keys / rotated env vars are picked up
+            # without a service restart.
+            candidates = await self._resolve_candidates()
+            if not candidates:
+                logger.warning("live_ingestion_skipped_no_api_key")
+                # No keys at all → nothing useful to retry; bail out instead
+                # of busy-looping the reconnect loop.
+                self._dead = True
+                logger.error(
+                    "live_ingestion_terminated_no_keys",
+                    hint="manual intervention required: register a Databento key",
+                )
+                return
+
+            connected = False
+            for candidate in candidates:
+                if self._stop.is_set():
+                    return
+                try:
+                    logger.info(
+                        "live_ingestion_connecting",
+                        attempt=attempt,
+                        schemas=self._schemas,
+                        key_label=candidate.label,
+                        key_source=candidate.source,
+                    )
+                    # Bootstrap the registry on every candidate switch so the
+                    # in-memory map matches the key we're about to stream
+                    # against (different subscription tiers expose different
+                    # contracts).
+                    await self._bootstrap_registry(candidate.api_key)
+                    self._active_key_label = candidate.label
+                    await self._stream_once(candidate)
+                    # Stream returned cleanly (close/stop); reset backoff.
+                    backoff = INITIAL_BACKOFF_S
+                    connected = True
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    msg = str(exc)
+                    self._last_error = msg[:500]
+                    dropped = self._drop_unsupported_schema(msg)
+                    if dropped:
+                        self._dropped_schemas.append(dropped)
+                        logger.warning(
+                            "live_dropping_unsupported_schema",
+                            dropped=dropped,
+                            remaining=self._schemas,
+                        )
+                        if not self._schemas:
+                            self._dead = True
+                            logger.error(
+                                "live_ingestion_no_schemas_left",
+                                hint=(
+                                    "register a key with appropriate "
+                                    "Databento entitlements"
+                                ),
+                            )
+                            return
+                        # Don't burn an attempt for a config-time fix; retry
+                        # the SAME candidate with the trimmed schema list.
+                        attempt -= 1
+                        connected = True  # treat as resolved for backoff
+                        break
+                    logger.exception(
+                        "live_ingestion_stream_failed",
+                        error=msg,
+                        key_label=candidate.label,
+                    )
+                    await self._record_candidate_error(candidate, msg)
+                    # Try the next candidate before consuming a reconnect
+                    # attempt — failover is the whole point of the pool.
+                    continue
+
+            if connected:
+                continue
+
+            if attempt >= MAX_RECONNECTS:
+                self._dead = True
+                logger.error(
+                    "live_ingestion_giving_up",
+                    attempts=attempt,
+                    hint="manual intervention required",
+                )
+                return
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
+
+    async def _resolve_candidates(self) -> list[KeyCandidate]:
+        """Resolve the prioritised candidate list (env first, then DB pool)."""
+        try:
+            factory = get_session_factory()
+            async with factory() as session:
+                return await iter_keys(session, DATASET)
+        except Exception:  # noqa: BLE001 — degrade to env-only on DB failure
+            logger.exception("live_ingestion_key_pool_resolve_failed")
+            env_key = self._settings.opra_api_key
+            if env_key:
+                return [
+                    KeyCandidate(
+                        label=f"env:{DATASET}",
+                        api_key=env_key,
+                        source="env",
+                    )
+                ]
+            return []
+
+    async def _record_candidate_error(
+        self, candidate: KeyCandidate, error_msg: str
+    ) -> None:
+        if candidate.source != "db":
+            return
+        try:
+            factory = get_session_factory()
+            async with factory() as session:
+                await record_key_error(session, candidate, error_msg=error_msg)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "live_ingestion_record_key_error_failed",
+                key_label=candidate.label,
+            )
+
+    async def _record_candidate_success(self, candidate: KeyCandidate) -> None:
+        if candidate.source != "db":
+            return
+        try:
+            factory = get_session_factory()
+            async with factory() as session:
+                await record_key_success(session, candidate)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "live_ingestion_record_key_success_failed",
+                key_label=candidate.label,
+            )
+
+    async def _bootstrap_registry(self, api_key: str | None = None) -> None:
         """Populate ``self._registry`` from the Historical definition schema.
 
         We pull the latest available trading day's definitions for each
         configured parent symbol and load them into the registry so live
         trade / statistics records can be mapped back to a contract.
+
+        ``api_key`` is the resolved candidate's key — falls back to the
+        env-configured one when called from a context that doesn't have a
+        candidate yet (e.g. the periodic refresh loop).
         """
         try:
             import databento as db
         except ImportError:
             return
 
-        from datetime import timedelta
+        key = api_key or self._settings.opra_api_key
+        if not key:
+            return
 
-        client = db.Historical(key=self._settings.opra_api_key)
+        client = db.Historical(key=key)
         # Use a 30-min buffer below "now" to stay safely inside the published
         # data window (mirrors ``databento_historical.py``).
         end = datetime.now(UTC) - timedelta(minutes=30)
@@ -363,12 +552,21 @@ class DatabentoLiveIngester:
             ):
                 self._schemas.remove(schema)
                 return schema
+        # Fallback: the gateway changed its error format. Don't drop a
+        # schema speculatively (we'd burn entitlements for non-schema errors)
+        # but log loudly so operators can update the matcher.
+        if any(fragment in msg for fragment in _AUTH_ERROR_FRAGMENTS):
+            logger.warning(
+                "schema_drop_unrecognized_error_format",
+                schemas_active=list(self._schemas),
+                error=error_message[:300],
+            )
         return None
 
-    async def _stream_once(self) -> None:
+    async def _stream_once(self, candidate: KeyCandidate) -> None:
         import databento as db
 
-        client = db.Live(key=self._settings.opra_api_key)
+        client = db.Live(key=candidate.api_key)
         for symbol in self._settings.supported_symbols:
             parent = _parent(symbol)
             for schema in self._schemas:
@@ -379,9 +577,16 @@ class DatabentoLiveIngester:
                     stype_in="parent",
                 )
 
+        first_record_seen = False
         async for record in client:
             if self._stop.is_set():
                 break
+            if not first_record_seen:
+                first_record_seen = True
+                # Reset error counters / mark last_used_at on the row that
+                # connected. We only do this once per stream so a brief
+                # success on a flaky key doesn't repeatedly thrash the row.
+                await self._record_candidate_success(candidate)
             try:
                 await self._handle_record(record)
             except Exception:  # noqa: BLE001
@@ -399,11 +604,13 @@ class DatabentoLiveIngester:
         self._last_record_at = datetime.now(UTC)
         # Capture a snapshot of the first record of each type — invaluable for
         # diagnosing why fields like bid/ask aren't being parsed (e.g. Databento
-        # SDK normalised the field name differently than expected).
+        # SDK normalised the field name differently than expected). We use an
+        # explicit allowlist rather than ``dir(record)`` so ErrorMsg / SystemMsg
+        # frames don't leak auth tokens, URLs, or headers via diagnostics.
         if rtype not in self._sample_record_attrs:
             attrs: dict[str, Any] = {}
-            for name in dir(record):
-                if name.startswith("_"):
+            for name in _DIAGNOSTICS_ATTR_ALLOWLIST:
+                if not hasattr(record, name):
                     continue
                 try:
                     val = getattr(record, name)
@@ -468,11 +675,31 @@ class DatabentoLiveIngester:
         )
         self._record_counts.clear()
 
+    async def _maybe_refresh_registry_for_misses(self) -> None:
+        """Re-bootstrap the registry when persistent unmatched trades pile up.
+
+        A small cooldown stops a noisy stream from spamming definition-schema
+        calls (each is a Historical request).
+        """
+        cooldown = timedelta(minutes=5)
+        now = datetime.now(UTC)
+        last = self._last_unmatched_bootstrap_at
+        if last is not None and (now - last) < cooldown:
+            return
+        self._last_unmatched_bootstrap_at = now
+        try:
+            await self._bootstrap_registry()
+        except Exception:  # noqa: BLE001
+            logger.exception("live_unmatched_registry_refresh_failed")
+
     async def _handle_trade(self, record: Any) -> None:
         instrument_id = getattr(record, "instrument_id", None)
         contract = self._registry.get(instrument_id) if instrument_id else None
         if contract is None:
-            # Diagnostic: log the first few unmatched ids so we can debug.
+            self._unmatched_total += 1
+            # Keep the legacy "first 5" log so a fresh deployment still surfaces
+            # a sample in plain logs; everything after that goes to the periodic
+            # rollup at the 100-multiple boundary.
             self._unmatched_count = getattr(self, "_unmatched_count", 0) + 1
             if self._unmatched_count <= 5:
                 logger.info(
@@ -481,6 +708,17 @@ class DatabentoLiveIngester:
                     raw_symbol=getattr(record, "raw_symbol", None),
                     registry_sample=list(self._registry.keys())[:3],
                 )
+            if self._unmatched_total % 100 == 0:
+                logger.warning(
+                    "live_trade_unmatched_rollup",
+                    unmatched_total=self._unmatched_total,
+                    registry_size=len(self._registry),
+                )
+            # Trigger an out-of-cycle registry refresh after a sustained miss
+            # streak — bounded by a cooldown so a noisy stream can't spam
+            # bootstrap calls.
+            if self._unmatched_total % 50 == 0:
+                await self._maybe_refresh_registry_for_misses()
             return
 
         price = _scale_price(getattr(record, "price", None))
@@ -513,6 +751,15 @@ class DatabentoLiveIngester:
             size_int = int(size)
         except (TypeError, ValueError):
             return
+        ts = self._record_ts(record)
+        if ts is None:
+            self._dropped_no_ts_count += 1
+            logger.warning(
+                "live_trade_dropped_no_ts",
+                instrument_id=instrument_id,
+                dropped_total=self._dropped_no_ts_count,
+            )
+            return
         contract = self._registry[instrument_id]
         state = self._state.get(instrument_id, {})
 
@@ -524,10 +771,24 @@ class DatabentoLiveIngester:
 
         # Quote-rule classifier inline (kept simple — full Lee-Ready with
         # tick fallback runs in the pipeline against the persisted rows).
+        # Reject stale NBBO so the side / signed_premium columns never
+        # carry quote-rule output computed against a multi-second-old book.
         bid = state.get("bid")
         ask = state.get("ask")
+        quote_ts = state.get("quote_ts")
+        quote_fresh = (
+            quote_ts is not None
+            and (ts - quote_ts).total_seconds() <= _QUOTE_MAX_AGE_S
+            and (ts - quote_ts).total_seconds() >= 0
+        )
         side: int | None = None
-        if bid is not None and ask is not None and bid > 0 and ask > 0:
+        if (
+            quote_fresh
+            and bid is not None
+            and ask is not None
+            and bid > 0
+            and ask > 0
+        ):
             mid = (bid + ask) / 2.0
             if price > mid:
                 side = 1
@@ -542,7 +803,7 @@ class DatabentoLiveIngester:
             signed_premium = -side * size_int * price * 100.0
 
         await self._trade_writer.add({
-            "ts": self._record_ts(record),
+            "ts": ts,
             "symbol": contract["symbol"],
             "expiration": contract["expiration"],
             "strike": contract["strike"],
@@ -550,8 +811,8 @@ class DatabentoLiveIngester:
             "seq": seq_int,
             "price": price,
             "size": size_int,
-            "bid": bid,
-            "ask": ask,
+            "bid": bid if quote_fresh else None,
+            "ask": ask if quote_fresh else None,
             "exchange": _coerce_str(getattr(record, "publisher_id", None)),
             "side": side,
             "signed_premium": signed_premium,
@@ -672,6 +933,13 @@ class DatabentoLiveIngester:
             state["bid"] = bid
         if ask is not None:
             state["ask"] = ask
+        # Stamp the quote with whichever timestamp we can find — the trade
+        # path uses this to discard stale NBBO. Falls back to wall clock if
+        # the record carries no usable ts_event so a working book without
+        # ts is still usable for the freshness window.
+        if bid is not None or ask is not None:
+            ts = self._record_ts(record)
+            state["quote_ts"] = ts if ts is not None else datetime.now(UTC)
 
         await self._emit_row(instrument_id, record)
 
@@ -682,7 +950,10 @@ class DatabentoLiveIngester:
             return
 
         stat_type = getattr(record, "stat_type", None)
-        value = getattr(record, "quantity", None) or getattr(record, "value", None)
+        # Don't fall through on a legitimate ``quantity == 0`` — only swap to
+        # ``value`` when ``quantity`` was actually missing.
+        q = getattr(record, "quantity", None)
+        value = q if q is not None else getattr(record, "value", None)
 
         state = self._state.setdefault(instrument_id, {})
         # Databento stat_type values: 9 -> open interest, 10 -> cumulative volume (approximate).
@@ -703,6 +974,14 @@ class DatabentoLiveIngester:
         contract = self._registry[instrument_id]
         state = self._state.get(instrument_id, {})
         ts = self._record_ts(record)
+        if ts is None:
+            self._dropped_no_ts_count += 1
+            logger.warning(
+                "live_chain_row_dropped_no_ts",
+                instrument_id=instrument_id,
+                dropped_total=self._dropped_no_ts_count,
+            )
+            return
         row = {
             "ts": ts,
             "symbol": contract["symbol"],
@@ -722,15 +1001,21 @@ class DatabentoLiveIngester:
         await self._writer.add(row)
 
     @staticmethod
-    def _record_ts(record: Any) -> datetime:
+    def _record_ts(record: Any) -> datetime | None:
+        """Convert ``record.ts_event`` (ns int) into a UTC datetime.
+
+        Returns ``None`` on parse failure so callers can skip + count the
+        drop. Fabricating ``datetime.now(UTC)`` would create batch-wide PK
+        collisions under load.
+        """
         ts_event = getattr(record, "ts_event", None)
         if ts_event is None:
-            return datetime.now(UTC)
+            return None
         try:
             # Databento ts_event is nanoseconds since epoch.
             return datetime.fromtimestamp(int(ts_event) / 1e9, tz=UTC)
         except (TypeError, ValueError, OverflowError):
-            return datetime.now(UTC)
+            return None
 
 
 _ingester: DatabentoLiveIngester | None = None

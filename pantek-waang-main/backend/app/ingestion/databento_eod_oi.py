@@ -35,12 +35,18 @@ import asyncio
 from datetime import UTC, date, datetime, timedelta
 
 import pandas as pd
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
 from app.config import get_settings
 from app.core.logging import get_logger
 from app.db.models import EodOpenInterest
 from app.db.session import get_session_factory
+
+try:
+    from app.processing.session import _now_eastern as _eastern_now
+except ImportError:  # pragma: no cover — defensive: session module restructured
+    _eastern_now = None  # type: ignore[assignment]
 
 logger = get_logger(__name__)
 
@@ -369,6 +375,15 @@ async def upsert_eod_oi(rows: list[dict]) -> int:
     factory = get_session_factory()
     async with factory() as session:
         stmt = insert(EodOpenInterest).values(rows)
+        # TODO(schema): EOD OI table PK is (symbol, expiration, strike,
+        # option_type) — ``oi_date`` is NOT part of the conflict key, so
+        # every daily run overwrites the previous day's row and we lose
+        # OI history. Fixing this requires adding ``oi_date`` to the PK
+        # (a migration), which is out of scope here. Until then, callers
+        # MUST guard against re-running for an ``oi_date`` that's already
+        # present (see :func:`run_eod_oi_ingestion`'s same-day check), and
+        # we refuse to overwrite a row whose stored ``oi_date`` is newer
+        # than the row we're about to write.
         stmt = stmt.on_conflict_do_update(
             index_elements=["symbol", "expiration", "strike", "option_type"],
             set_={
@@ -376,15 +391,52 @@ async def upsert_eod_oi(rows: list[dict]) -> int:
                 "open_interest": stmt.excluded.open_interest,
                 "updated_at": stmt.excluded.updated_at,
             },
+            # Refuse to overwrite a newer oi_date with an older one. This
+            # protects against an out-of-order replay (e.g. a startup pull
+            # racing the scheduled one) clobbering today's row with
+            # yesterday's data.
+            where=(EodOpenInterest.oi_date <= stmt.excluded.oi_date),
         )
         await session.execute(stmt)
         await session.commit()
     return len(rows)
 
 
+def _today_eastern() -> date:
+    """Today's date in America/New_York. Falls back to UTC if helper missing."""
+    if _eastern_now is not None:
+        return _eastern_now().date()
+    return datetime.now(UTC).date()
+
+
 async def run_eod_oi_ingestion() -> int:
     """Pull EOD OI for every supported symbol. Returns total rows upserted."""
     settings = get_settings()
+
+    # Idempotency guard: if today's oi_date is already present we skip the
+    # whole pull. The PK doesn't include oi_date so the upsert would happily
+    # rewrite the same data — this saves a Databento round-trip and a noisy
+    # write storm on startup + scheduled-job overlap.
+    today = _today_eastern()
+    try:
+        factory = get_session_factory()
+        async with factory() as session:
+            result = await session.execute(
+                select(EodOpenInterest.oi_date)
+                .order_by(EodOpenInterest.oi_date.desc())
+                .limit(1)
+            )
+            latest = result.scalar_one_or_none()
+        if latest is not None and latest >= today:
+            logger.info(
+                "eod_oi_skip_already_pulled_today",
+                latest=str(latest),
+                today=str(today),
+            )
+            return 0
+    except Exception:  # noqa: BLE001 — fail open, run the pull regardless
+        logger.exception("eod_oi_idempotency_check_failed")
+
     total = 0
     for symbol in settings.supported_symbols:
         try:

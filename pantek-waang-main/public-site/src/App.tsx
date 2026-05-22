@@ -12,6 +12,8 @@ import Register from "@/pages/Register";
 import { useAuth } from "@/lib/auth";
 import { useTheme } from "@/hooks/useTheme";
 import { toast } from "@/components/ui/toast";
+import { destinationForStatus } from "@/lib/redirects";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 
 // Code-split the heavier authenticated views and rare error pages so they
 // don't bloat the initial bundle for the marketing landing page.
@@ -72,7 +74,9 @@ function AppShell() {
           path="/dashboard"
           element={
             <Protected requireStatus="approved">
-              <Dashboard />
+              <ErrorBoundary>
+                <Dashboard />
+              </ErrorBoundary>
             </Protected>
           }
         />
@@ -80,7 +84,9 @@ function AppShell() {
           path="/dashboard/:symbol"
           element={
             <Protected requireStatus="approved">
-              <Dashboard />
+              <ErrorBoundary>
+                <Dashboard />
+              </ErrorBoundary>
             </Protected>
           }
         />
@@ -102,6 +108,18 @@ function Protected({ children, requireStatus }: ProtectedProps) {
   const status = useAuth((s) => s.status);
   const initialized = useAuth((s) => s.initialized);
 
+  // Toasts must not fire during render — React 18 may invoke render twice in
+  // StrictMode and concurrent features will queue duplicate notifications.
+  useEffect(() => {
+    if (status === "banned") {
+      toast({
+        title: "Account banned",
+        description: "Reach out on Discord if you think this is a mistake.",
+        variant: "destructive",
+      });
+    }
+  }, [status]);
+
   if (!token) {
     return <Navigate to="/login" replace state={{ from: location.pathname }} />;
   }
@@ -112,11 +130,6 @@ function Protected({ children, requireStatus }: ProtectedProps) {
   }
 
   if (status === "banned") {
-    toast({
-      title: "Account banned",
-      description: "Reach out on Discord if you think this is a mistake.",
-      variant: "destructive",
-    });
     return <Navigate to="/login" replace />;
   }
 
@@ -135,13 +148,6 @@ function PublicOnly({ children }: { children: ReactNode }) {
     return <Navigate to={destinationForStatus(status)} replace />;
   }
   return <>{children}</>;
-}
-
-function destinationForStatus(status: string | null | undefined): string {
-  if (status === "approved") return "/dashboard";
-  if (status === "pending") return "/pending";
-  if (status === "rejected") return "/rejected";
-  return "/login";
 }
 
 export default function App() {

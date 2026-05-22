@@ -8,7 +8,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { cn } from "@/lib/utils";
+import { cn, formatTimeET } from "@/lib/utils";
 import type { FlowEvent, FlowPayload } from "@/lib/streamClient";
 
 function formatPremium(value: number | null | undefined): string {
@@ -17,18 +17,6 @@ function formatPremium(value: number | null | undefined): string {
   if (abs >= 1e6) return `$${(value / 1e6).toFixed(2)}M`;
   if (abs >= 1e3) return `$${(value / 1e3).toFixed(1)}K`;
   return `$${value.toFixed(0)}`;
-}
-
-function formatTime(ts: string): string {
-  try {
-    return new Date(ts).toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    });
-  } catch {
-    return ts;
-  }
 }
 
 function contractLabel(ev: FlowEvent): string {
@@ -106,7 +94,7 @@ export function FlowFeed({ flow }: FlowFeedProps) {
                   </Badge>
                   <div className="flex flex-1 flex-col">
                     <span className="font-mono text-xs text-muted-foreground">
-                      {formatTime(ev.ts)}
+                      {formatTimeET(ev.ts)}
                     </span>
                     <span className="truncate font-mono">{contractLabel(ev)}</span>
                   </div>

@@ -89,6 +89,13 @@ export function DatabentoKeysPage() {
 
   async function onCreate(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    // Databento keys are 32+ char tokens — anything shorter is almost
+    // certainly a paste error. Catch it client-side before the encrypted
+    // round-trip.
+    if (form.api_key.trim().length < 32) {
+      setError("Databento API key looks too short (must be at least 32 characters).");
+      return;
+    }
     setSubmitting(true);
     setError(null);
     try {
@@ -135,6 +142,7 @@ export function DatabentoKeysPage() {
   }
 
   async function remove(row: DatabentoKeySummary) {
+    // TODO(ux): replace with Radix AlertDialog for consistent styling.
     if (
       !confirm(
         `Delete Databento key "${row.label}"? This will remove it from the failover pool.`,
@@ -155,11 +163,14 @@ export function DatabentoKeysPage() {
   async function testKey(row: DatabentoKeySummary) {
     try {
       const r = await DatabentoKeys.test(row.id);
-      setTestResult(`${row.label}: ${r.ok ? "OK" : "FAILED"} — ${r.message}`);
+      // Backends sometimes return verbose error stacks here; cap to keep
+      // the inline banner readable and prevent layout blow-up.
+      const msg = r.ok ? "OK" : String(r.message ?? "").slice(0, 120);
+      setTestResult(`${row.label}: ${msg}`);
     } catch (err) {
       const detail =
         (err as { response?: { data?: { detail?: string } } }).response?.data?.detail;
-      setTestResult(detail || (err as Error).message);
+      setTestResult(String(detail || (err as Error).message || "Unknown error").slice(0, 120));
     }
   }
 
@@ -232,6 +243,7 @@ export function DatabentoKeysPage() {
                         size="sm"
                         onClick={() => changePriority(row, -10)}
                         title="Higher priority (lower number)"
+                        aria-label="Increase priority"
                       >
                         ↑
                       </Button>
@@ -241,6 +253,7 @@ export function DatabentoKeysPage() {
                         size="sm"
                         onClick={() => changePriority(row, 10)}
                         title="Lower priority (higher number)"
+                        aria-label="Decrease priority"
                       >
                         ↓
                       </Button>
@@ -338,9 +351,16 @@ export function DatabentoKeysPage() {
                 min={0}
                 max={10000}
                 value={form.priority}
-                onChange={(e) =>
-                  setForm({ ...form, priority: Number(e.target.value) })
-                }
+                onChange={(e) => {
+                  // Empty / invalid input → fall back to default (100)
+                  // rather than NaN, which would otherwise propagate to
+                  // the backend and 422.
+                  const parsed = parseInt(e.target.value, 10);
+                  setForm({
+                    ...form,
+                    priority: Number.isFinite(parsed) ? parsed : 100,
+                  });
+                }}
               />
             </div>
             <DialogFooter>

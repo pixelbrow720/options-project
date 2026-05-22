@@ -183,21 +183,24 @@ async def is_member_of_guild(
     bot_token: str,
     *,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
-) -> bool:
-    """Return ``True`` iff ``user_id`` is a member of ``guild_id``.
+) -> bool | None:
+    """Check whether ``user_id`` is a member of ``guild_id``.
+
+    Tri-state return:
+      * ``True``  — Discord confirmed membership (HTTP 200 + body).
+      * ``False`` — Discord *definitively* says not-a-member (HTTP 404).
+      * ``None``  — outcome unknown (transport error, 401/403/5xx,
+        empty body). Callers should treat ``None`` as "do not change
+        the cached guild_verified state" so transient blips don't
+        revoke verification from already-verified users.
 
     Uses the Bot token route (``GET /guilds/{guild}/members/{user}``).
     The bot must be in the guild and have the GUILD_MEMBERS intent
     enabled in the developer portal — without it Discord will return
     403 even though the route looks fine.
-
-    Defensive: any non-200 (404 = not a member, 403 = bot not allowed,
-    401 = bad token, transport error) returns ``False`` rather than
-    raising, so the callback handler can render a friendly "join the
-    Discord first" page.
     """
     if not (user_id and guild_id and bot_token):
-        return False
+        return None
 
     headers = {"Authorization": f"Bot {bot_token}"}
     url = f"{DISCORD_API_BASE}/guilds/{guild_id}/members/{user_id}"
@@ -206,20 +209,24 @@ async def is_member_of_guild(
             resp = await client.get(url, headers=headers)
     except httpx.HTTPError as exc:
         logger.warning("discord.guild_membership.network_error", error=str(exc))
-        return False
+        return None
 
+    if resp.status_code == 404:
+        logger.info("discord.guild_membership.not_member", status=404)
+        return False
     if resp.status_code != 200:
         logger.info(
-            "discord.guild_membership.not_member",
+            "discord.guild_membership.unknown",
             status=resp.status_code,
         )
-        return False
+        return None
 
-    # A 200 with an empty body would be unusual but we still treat it as
-    # "not verified" — Discord always returns the member object on
-    # success.
+    # A 200 with an empty body would be unusual — treat as unknown so
+    # we don't revoke verification on a malformed Discord response.
     try:
         body = resp.json()
     except ValueError:
-        return False
-    return bool(body)
+        return None
+    if not body:
+        return None
+    return True

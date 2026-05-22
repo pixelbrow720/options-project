@@ -22,12 +22,16 @@ from __future__ import annotations
 
 import asyncio
 import re
-from datetime import UTC, date, datetime, time as dtime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from datetime import time as dtime
 
 import pandas as pd
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import get_settings
 from app.core.logging import get_logger
+from app.db.models import BackfillCheckpoint
+from app.db.session import get_session_factory
 from app.ingestion.writer import OptionsChainWriter, get_writer
 from app.processing.session import RTH_TZ, _is_business_day, _now_eastern, session_close_today
 
@@ -298,11 +302,6 @@ def _last_close_window(
         d = now_et.date() - timedelta(days=1)
         for _ in range(10):  # bounded — we'll find one inside 10 days
             if _is_business_day(d):
-                _, close_t = (
-                    # close time comes from the configured RTH window
-                    dtime(0, 0),  # placeholder; replaced below
-                    None,
-                )
                 # Reuse session_close_today by anchoring "now" on that date.
                 anchor = datetime.combine(d, dtime(12, 0), tzinfo=RTH_TZ)
                 candidate_close = session_close_today(now=anchor)
@@ -345,6 +344,70 @@ def _ts_event_to_dt(value: object) -> datetime | None:
             return datetime.fromtimestamp(int(value) / 1e9, tz=UTC)
         except (TypeError, ValueError, OverflowError):
             return None
+
+
+def _reduce_last_per_instrument(records_iterable) -> tuple[list, dict[str, int]]:
+    """Stream through Databento's record iterable, keeping ONE record per
+    ``instrument_id`` (the latest — by iteration order — wins).
+
+    The Phase-2 backfill only needs the closing snapshot per contract, so
+    materialising the full window via ``list(data)`` is wasteful: a 30-min
+    cbbo-1m pull across an OPRA parent fans out to millions of records and
+    OOM's the worker. This streamed reduction keeps memory bounded to one
+    entry per instrument.
+
+    Returns the reduced list plus a counters dict so callers can log how
+    many records were skipped without re-iterating.
+    """
+    latest: dict[int, object] = {}
+    counters = {"total_seen": 0, "skipped_no_iid": 0, "skipped_no_levels": 0}
+    for rec in records_iterable:
+        counters["total_seen"] += 1
+        iid_raw = getattr(rec, "instrument_id", None)
+        if iid_raw is None:
+            counters["skipped_no_iid"] += 1
+            continue
+        try:
+            iid = int(iid_raw)
+        except (TypeError, ValueError):
+            counters["skipped_no_iid"] += 1
+            continue
+        # Filter to BBO-like records (skip SymbolMappingMsg, ErrorMsg, etc.).
+        if not (hasattr(rec, "levels") or hasattr(rec, "bid_px")):
+            counters["skipped_no_levels"] += 1
+            continue
+        latest[iid] = rec
+    return list(latest.values()), counters
+
+
+async def _write_backfill_checkpoint(
+    *, dataset: str, symbol: str
+) -> None:
+    """Mark a per-parent backfill as complete. Best-effort: never raises."""
+    try:
+        factory = get_session_factory()
+        now = datetime.now(UTC)
+        async with factory() as session:
+            stmt = pg_insert(BackfillCheckpoint).values(
+                dataset=dataset,
+                symbol=symbol,
+                last_completed_at=now,
+                updated_at=now,
+            ).on_conflict_do_update(
+                index_elements=["dataset", "symbol"],
+                set_={
+                    "last_completed_at": now,
+                    "updated_at": now,
+                },
+            )
+            await session.execute(stmt)
+            await session.commit()
+    except Exception:  # noqa: BLE001 — checkpoints must never break backfill
+        logger.exception(
+            "backfill_checkpoint_write_failed",
+            dataset=dataset,
+            symbol=symbol,
+        )
 
 
 async def run_historical_quotes_backfill(
@@ -444,12 +507,22 @@ async def run_historical_quotes_backfill(
         # 1-minute consolidated BBO; ``tcbbo`` (trade-tagged consolidated
         # BBO) is a smaller / often more available alternative we fall
         # back to when cbbo-1m is empty or unauthorized.
-        records: list = []
+        last_by_instrument: dict[int, object] = {}
+        reduce_counters: dict[str, int] = {
+            "total_seen": 0,
+            "skipped_no_iid": 0,
+            "skipped_no_levels": 0,
+        }
         last_error: str | None = None
         used_schema: str | None = None
         for schema_candidate in ("cbbo-1m", "tcbbo"):
             symbol_end = window_end
-            attempt_records: list = []
+            attempt_last: dict[int, object] = {}
+            attempt_counters: dict[str, int] = {
+                "total_seen": 0,
+                "skipped_no_iid": 0,
+                "skipped_no_levels": 0,
+            }
             schema_failed = False
             for retry in range(2):
                 try:
@@ -462,10 +535,15 @@ async def run_historical_quotes_backfill(
                         start=window_start,
                         end=symbol_end,
                     )
-                    # Materialize records via iteration (skip to_df bug)
-                    attempt_records = await asyncio.to_thread(
-                        lambda: list(data)
+                    # Stream the iterator and reduce to one record per
+                    # instrument_id inline — avoids materialising the full
+                    # multi-million-record window (which OOM'd the worker).
+                    reduced, attempt_counters = await asyncio.to_thread(
+                        _reduce_last_per_instrument, data
                     )
+                    attempt_last = {
+                        int(r.instrument_id): r for r in reduced
+                    }
                     break
                 except Exception as exc:  # noqa: BLE001
                     msg = str(exc)
@@ -483,7 +561,7 @@ async def run_historical_quotes_backfill(
                             schema=schema_candidate,
                             error=msg[:200],
                         )
-                        attempt_records = []
+                        attempt_last = {}
                         schema_failed = True
                         break
                     if (
@@ -506,7 +584,7 @@ async def run_historical_quotes_backfill(
                         schema=schema_candidate,
                         error=msg[:200],
                     )
-                    attempt_records = []
+                    attempt_last = {}
                     schema_failed = True
                     break
 
@@ -514,15 +592,17 @@ async def run_historical_quotes_backfill(
                 "historical_quotes_backfill_schema_attempt",
                 symbol=underlying,
                 schema=schema_candidate,
-                records=len(attempt_records),
+                contracts=len(attempt_last),
+                total_seen=attempt_counters.get("total_seen", 0),
                 failed=schema_failed,
             )
-            if attempt_records:
-                records = attempt_records
+            if attempt_last:
+                last_by_instrument = attempt_last
+                reduce_counters = attempt_counters
                 used_schema = schema_candidate
                 break
 
-        if not records:
+        if not last_by_instrument:
             logger.info(
                 "historical_quotes_backfill_empty",
                 symbol=underlying,
@@ -535,39 +615,13 @@ async def run_historical_quotes_backfill(
             continue
 
         logger.info(
-            "historical_quotes_backfill_records_received",
+            "historical_quotes_backfill_records_reduced",
             symbol=underlying,
             schema=used_schema,
-            total_records=len(records),
-        )
-
-        # Filter to BBOMsg-like records (skip SymbolMappingMsg, etc.) and
-        # group by instrument_id, keeping the LAST record per contract.
-        last_by_instrument: dict[int, object] = {}
-        skipped_no_iid = 0
-        skipped_no_levels = 0
-        for rec in records:
-            iid = getattr(rec, "instrument_id", None)
-            if iid is None:
-                skipped_no_iid += 1
-                continue
-            try:
-                iid = int(iid)
-            except (TypeError, ValueError):
-                skipped_no_iid += 1
-                continue
-            # cbbo-1m records have levels[0] with bid/ask, or bid_px/ask_px attrs
-            if not (hasattr(rec, "levels") or hasattr(rec, "bid_px")):
-                skipped_no_levels += 1
-                continue
-            last_by_instrument[iid] = rec
-
-        logger.info(
-            "historical_quotes_backfill_filtered",
-            symbol=underlying,
             unique_contracts=len(last_by_instrument),
-            skipped_no_iid=skipped_no_iid,
-            skipped_no_levels=skipped_no_levels,
+            total_seen=reduce_counters.get("total_seen", 0),
+            skipped_no_iid=reduce_counters.get("skipped_no_iid", 0),
+            skipped_no_levels=reduce_counters.get("skipped_no_levels", 0),
             registry_size=len(registry),
         )
 
@@ -618,6 +672,12 @@ async def run_historical_quotes_backfill(
             }
             await writer.add(row)
             symbol_rows += 1
+
+        # Flush this parent's rows before recording the checkpoint so a
+        # crash between flush and checkpoint never claims completion for
+        # rows that weren't persisted.
+        await writer.flush()
+        await _write_backfill_checkpoint(dataset=DATASET, symbol=underlying)
 
         total_rows += symbol_rows
         logger.info(

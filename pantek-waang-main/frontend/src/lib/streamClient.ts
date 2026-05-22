@@ -5,6 +5,20 @@
  * (``/v1/{symbol}/stream/sse``) if the WebSocket upgrade fails.
  * Reconnects with exponential back-off capped at 30 s.
  *
+ * Authentication flow (preferred):
+ *   1. POST /v1/{symbol}/stream-ticket with X-API-Key header.
+ *   2. Server returns {ticket, ttl_seconds}.
+ *   3. Open WS with ?ticket=<ticket>. Tickets are short-lived, single-use.
+ *
+ * Legacy flow (fallback):
+ *   - WS with ?key=<api_key> directly. Triggered when the ticket endpoint
+ *     returns 404/501, or the server closes the ticket-based WS with code
+ *     1008 (server hasn't been redeployed yet).
+ *
+ * The WS may also be closed with code 4401 mid-stream — this signals the
+ * user's API key was revoked while the connection was open. Treat as an
+ * auth failure and prompt re-authentication.
+ *
  * Exposes a React context + ``useLiveSnapshot(symbol)`` hook returning the
  * latest snapshot payload and a connection status flag.
  */
@@ -21,7 +35,13 @@ import {
   type ReactNode,
 } from "react";
 
-export type ConnectionStatus = "connecting" | "open" | "reconnecting" | "closed" | "error";
+export type ConnectionStatus =
+  | "connecting"
+  | "open"
+  | "reconnecting"
+  | "closed"
+  | "error"
+  | "auth-failed";
 
 // ── Snapshot payload shape ─────────────────────────────────────────────────
 //
@@ -224,6 +244,9 @@ export interface SnapshotEnvelope {
 const RECONNECT_INITIAL_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
 const STREAM_API_KEY_STORAGE = "ofa_stream_api_key";
+// Stream API key currently lives in localStorage. CSP (frame-ancestors none,
+// strict script-src) reduces XSS exfiltration risk; future work should move
+// to a session cookie or in-memory only handoff via /admin endpoint.
 
 export function getStoredApiKey(): string {
   if (typeof window === "undefined") return "";
@@ -239,6 +262,8 @@ export function setStoredApiKey(value: string): void {
   }
 }
 
+// `__API_BASE__` runtime override — set via inline `<script>` in index.html
+// before the bundle loads, or via a docker entrypoint that templates HTML.
 function getApiBaseUrl(): string {
   if (typeof window !== "undefined") {
     const override = (window as unknown as { __API_BASE__?: string }).__API_BASE__;
@@ -247,10 +272,12 @@ function getApiBaseUrl(): string {
   return import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 }
 
-function toWsUrl(base: string, path: string, key: string): string {
+function toWsUrl(base: string, path: string, params: Record<string, string>): string {
   const u = new URL(path, base);
   u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-  if (key) u.searchParams.set("key", key);
+  for (const [k, v] of Object.entries(params)) {
+    if (v) u.searchParams.set(k, v);
+  }
   return u.toString();
 }
 
@@ -258,6 +285,37 @@ function toSseUrl(base: string, path: string, key: string): string {
   const u = new URL(path, base);
   if (key) u.searchParams.set("key", key);
   return u.toString();
+}
+
+interface StreamTicket {
+  ticket: string;
+  ttl_seconds: number;
+}
+
+// Fetch a short-lived stream ticket. We deliberately use `fetch` here rather
+// than the shared axios `api` instance, because the admin axios injects an
+// `Authorization: Bearer <jwt>` header on every request — for the public
+// stream endpoint we need `X-API-Key` only, with no JWT pollution.
+async function fetchStreamTicket(
+  base: string,
+  symbol: string,
+  apiKey: string,
+): Promise<StreamTicket> {
+  const url = new URL(`/v1/${encodeURIComponent(symbol)}/stream-ticket`, base).toString();
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "X-API-Key": apiKey, "Content-Type": "application/json" },
+    body: "{}",
+  });
+  if (!resp.ok) {
+    throw new Error(`stream-ticket HTTP ${resp.status}`);
+  }
+  const body = (await resp.json()) as Partial<StreamTicket>;
+  if (!body || typeof body.ticket !== "string" || !body.ticket) {
+    throw new Error("stream-ticket: missing ticket field");
+  }
+  const ttl = typeof body.ttl_seconds === "number" ? body.ttl_seconds : 60;
+  return { ticket: body.ticket, ttl_seconds: ttl };
 }
 
 function parseFrame(raw: string): SnapshotEnvelope | null {
@@ -282,6 +340,14 @@ interface StreamConnection {
   close: () => void;
 }
 
+// Close codes (must match backend):
+//   1008  = policy violation (e.g. ticket auth not yet deployed) → fall back
+//           to legacy `?key=` query param once.
+//   4401  = credential revoked mid-stream → surface as "auth-failed", do not
+//           reconnect.
+const WS_CLOSE_POLICY_VIOLATION = 1008;
+const WS_CLOSE_CREDENTIAL_REVOKED = 4401;
+
 function openStream(
   symbol: string,
   apiKey: string,
@@ -294,6 +360,9 @@ function openStream(
   let backoffMs = RECONNECT_INITIAL_MS;
   let wsHasOpened = false;
   let usingSse = false;
+  // Once the server tells us tickets aren't supported (1008), we drop back
+  // to legacy `?key=` for the rest of this session.
+  let legacyKeyMode = false;
   const base = getApiBaseUrl();
 
   function scheduleReconnect(): void {
@@ -304,7 +373,7 @@ function openStream(
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       if (closed) return;
-      connect();
+      void connect();
     }, delay);
   }
 
@@ -343,16 +412,8 @@ function openStream(
     };
   }
 
-  function connect(): void {
-    if (closed) return;
-    if (usingSse) {
-      connectSse();
-      return;
-    }
-    handlers.onStatus("connecting");
-    wsHasOpened = false;
+  function openWebSocket(url: string): void {
     try {
-      const url = toWsUrl(base, `/v1/${encodeURIComponent(symbol)}/stream`, apiKey);
       ws = new WebSocket(url);
     } catch {
       // Browser rejected the URL entirely — flip to SSE fallback.
@@ -379,17 +440,76 @@ function openStream(
         usingSse = true;
       }
     };
-    ws.onclose = () => {
+    ws.onclose = (ev: CloseEvent) => {
       ws = null;
       if (closed) {
         handlers.onStatus("closed");
         return;
       }
+      // Credential was revoked mid-stream — bail out, do not retry.
+      if (ev.code === WS_CLOSE_CREDENTIAL_REVOKED) {
+        closed = true;
+        handlers.onStatus("auth-failed");
+        return;
+      }
+      // Server doesn't yet understand the ticket flow (older deploy) — fall
+      // back to legacy `?key=` for the rest of this session.
+      if (ev.code === WS_CLOSE_POLICY_VIOLATION && !legacyKeyMode && !wsHasOpened) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          "[streamClient] ticket flow rejected (1008); falling back to legacy ?key= auth",
+        );
+        legacyKeyMode = true;
+        // Reconnect immediately on the next tick.
+        backoffMs = RECONNECT_INITIAL_MS;
+      }
       scheduleReconnect();
     };
   }
 
-  connect();
+  async function connect(): Promise<void> {
+    if (closed) return;
+    if (usingSse) {
+      connectSse();
+      return;
+    }
+    handlers.onStatus("connecting");
+    wsHasOpened = false;
+
+    if (legacyKeyMode) {
+      const url = toWsUrl(base, `/v1/${encodeURIComponent(symbol)}/stream`, { key: apiKey });
+      openWebSocket(url);
+      return;
+    }
+
+    // Preferred path: fetch a short-lived ticket, then open WS with it.
+    let ticket: StreamTicket;
+    try {
+      ticket = await fetchStreamTicket(base, symbol, apiKey);
+    } catch (err) {
+      // Ticket endpoint failed — log + fall back to legacy key. We only do
+      // this once per session; if legacy also fails, the WS close handler
+      // will surface the error normally.
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[streamClient] stream-ticket fetch failed, falling back to legacy ?key=",
+        err,
+      );
+      legacyKeyMode = true;
+      if (closed) return;
+      const url = toWsUrl(base, `/v1/${encodeURIComponent(symbol)}/stream`, { key: apiKey });
+      openWebSocket(url);
+      return;
+    }
+
+    if (closed) return;
+    const url = toWsUrl(base, `/v1/${encodeURIComponent(symbol)}/stream`, {
+      ticket: ticket.ticket,
+    });
+    openWebSocket(url);
+  }
+
+  void connect();
 
   return {
     close: () => {
@@ -466,7 +586,15 @@ export function LiveSnapshotProvider({ initialSymbol, children }: LiveSnapshotPr
       setSnapshot(frame);
       setLastFrameAt(Date.now());
     },
-    onStatus: setStatus,
+    onStatus: (next: ConnectionStatus) => {
+      setStatus(next);
+      // Server told us the credential was revoked mid-stream — drop the
+      // cached key so the next reconnect attempt prompts the user.
+      if (next === "auth-failed") {
+        setStoredApiKey("");
+        setApiKeyState("");
+      }
+    },
   };
 
   useEffect(() => {
@@ -498,4 +626,4 @@ export function useLiveSnapshot(): LiveSnapshotValue {
 }
 
 // Exported for tests.
-export const __internal = { parseFrame, toWsUrl, toSseUrl };
+export const __internal = { parseFrame, toWsUrl, toSseUrl, fetchStreamTicket };

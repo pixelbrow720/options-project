@@ -6,6 +6,10 @@
  *
  * Use this alongside `useLiveStream` — that one delivers full snapshot
  * frames every ~30s, this one delivers tiny price ticks at OPRA cadence.
+ *
+ * TODO(auth): migrate to the ticket-based flow used by stream.ts once the
+ * backend wires `/public/{symbol}/ticks-ticket`. For now we keep `?token=`
+ * (deprecated but still accepted by the backend).
  */
 
 import { useEffect, useState } from "react";

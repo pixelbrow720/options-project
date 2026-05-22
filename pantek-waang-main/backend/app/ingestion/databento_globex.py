@@ -32,10 +32,17 @@ from typing import Any
 from app.api.tick_notifier import get_tick_notifier
 from app.config import get_settings
 from app.core.logging import get_logger
+from app.db.session import get_session_factory
 from app.ingestion.bulk_writers import (
     BulkUpsertWriter,
     get_futures_tick_writer,
     get_liquidity_snapshot_writer,
+)
+from app.ingestion.key_pool import (
+    KeyCandidate,
+    iter_keys,
+    record_key_error,
+    record_key_success,
 )
 from app.processing.spot import _basis_cache
 
@@ -64,6 +71,41 @@ SNAPSHOT_INTERVAL_S = 1.0
 MAX_RECONNECTS = 5
 INITIAL_BACKOFF_S = 2.0
 
+# Allowlist for ``sample_record_attrs`` diagnostics — see databento_live.py.
+_DIAGNOSTICS_ATTR_ALLOWLIST: frozenset[str] = frozenset({
+    "bid_px",
+    "ask_px",
+    "bid_sz",
+    "ask_sz",
+    "instrument_id",
+    "raw_symbol",
+    "ts_event",
+    "ts_recv",
+    "stat_type",
+    "quantity",
+    "value",
+    "price",
+    "size",
+    "aggressor_side",
+    "publisher_id",
+    "expiration",
+    "expiration_date",
+    "strike_price",
+    "instrument_class",
+    "option_type",
+    "msg",
+    "err",
+})
+
+# Auth-style error fragments that imply a schema-drop event but did not
+# match one of the explicit ``"<schema> not authorized"`` substrings.
+_AUTH_ERROR_FRAGMENTS: tuple[str, ...] = (
+    "unauthorized",
+    "forbidden",
+    "not authorized",
+    "not supported",
+)
+
 
 def _scale_price(value: Any) -> float | None:
     if value is None:
@@ -77,14 +119,19 @@ def _scale_price(value: Any) -> float | None:
     return f
 
 
-def _record_ts(record: Any) -> datetime:
+def _record_ts(record: Any) -> datetime | None:
+    """Convert ``record.ts_event`` (ns int) to UTC datetime, or ``None`` on fail.
+
+    Fabricating ``datetime.now(UTC)`` would create batch-wide PK collisions
+    under load — callers must skip + count drops on ``None``.
+    """
     ts_event = getattr(record, "ts_event", None)
     if ts_event is None:
-        return datetime.now(UTC)
+        return None
     try:
         return datetime.fromtimestamp(int(ts_event) / 1e9, tz=UTC)
     except (TypeError, ValueError, OverflowError):
-        return datetime.now(UTC)
+        return None
 
 
 class GlobexLiveIngester:
@@ -120,6 +167,16 @@ class GlobexLiveIngester:
         # Captured gateway frames (SystemMsg / ErrorMsg). Most recent first.
         self._system_messages: list[str] = []
         self._error_messages: list[str] = []
+        # Sample record attrs (allowlisted) for first record of each type.
+        self._sample_record_attrs: dict[str, dict[str, Any]] = {}
+        # Terminal-failure flag — set after MAX_RECONNECTS or no schemas left.
+        self._dead: bool = False
+        # Counter for trades dropped due to unparseable timestamp.
+        self._dropped_no_ts_count: int = 0
+        # Counter for trades whose instrument_id was not in the registry.
+        self._unmatched_total: int = 0
+        # Most recent KeyCandidate label that successfully connected.
+        self._active_key_label: str | None = None
 
     def diagnostics(self) -> dict[str, Any]:
         return {
@@ -129,6 +186,7 @@ class GlobexLiveIngester:
             "schemas_active": list(self._schemas),
             "schemas_dropped": list(self._dropped_schemas),
             "record_counts": dict(self._cumulative_record_counts),
+            "sample_record_attrs": dict(self._sample_record_attrs),
             "first_record_at": (
                 self._first_record_at.isoformat() if self._first_record_at else None
             ),
@@ -139,11 +197,31 @@ class GlobexLiveIngester:
             "last_error": self._last_error,
             "system_messages": list(self._system_messages),
             "error_messages": list(self._error_messages),
+            "terminated": self._dead,
+            "attempts_remaining_until_terminal_reset": (
+                0 if self._dead
+                else max(0, MAX_RECONNECTS - self._connection_attempts)
+            ),
+            "dropped_no_ts_count": self._dropped_no_ts_count,
+            "unmatched_total": self._unmatched_total,
+            "active_key_label": self._active_key_label,
         }
+
+    def reset_after_terminal(self) -> None:
+        """Clear the terminal-failure flag so :meth:`start` can be called again."""
+        self._dead = False
+        self._connection_attempts = 0
+        self._last_error = None
 
     # ── Public API ─────────────────────────────────────────────────────────
     def start(self) -> None:
         if self._task is not None:
+            return
+        if self._dead:
+            logger.error(
+                "globex_live_start_blocked_terminal_state",
+                hint="call reset_after_terminal() before retrying",
+            )
             return
         self._task = asyncio.create_task(self._run_with_reconnect(),
                                          name="databento_globex_live")
@@ -151,6 +229,9 @@ class GlobexLiveIngester:
                                                   name="globex_book_snapshot_loop")
 
     async def stop(self) -> None:
+        # Idempotent — repeated stop() calls are a no-op.
+        if self._task is None:
+            return
         self._stop.set()
         for task in (self._task, self._snapshot_task):
             if task is not None:
@@ -161,14 +242,17 @@ class GlobexLiveIngester:
                     pass
         self._task = None
         self._snapshot_task = None
+        # Final flush so buffered rows are not lost on shutdown.
+        try:
+            await self._tick_writer.flush()
+            await self._liquidity_writer.flush()
+        except Exception:  # noqa: BLE001
+            logger.exception("globex_ingester_shutdown_flush_failed")
 
     # ── Internals ──────────────────────────────────────────────────────────
     async def _run_with_reconnect(self) -> None:
         if self._settings.disable_live_ingestion:
             logger.info("globex_live_disabled")
-            return
-        if not self._settings.globex_api_key:
-            logger.warning("globex_live_skipped_no_api_key")
             return
         try:
             import databento as db  # noqa: F401
@@ -183,39 +267,138 @@ class GlobexLiveIngester:
                 return
             attempt += 1
             self._connection_attempts = attempt
-            try:
-                logger.info(
-                    "globex_live_connecting",
-                    attempt=attempt,
-                    schemas=self._schemas,
-                    parents=self._parents,
+
+            # Resolve the candidate list at the start of every attempt so
+            # newly-registered DB keys / rotated env vars are picked up
+            # without a service restart.
+            candidates = await self._resolve_candidates()
+            if not candidates:
+                logger.warning("globex_live_skipped_no_api_key")
+                self._dead = True
+                logger.error(
+                    "globex_live_terminated_no_keys",
+                    hint="manual intervention required: register a Databento key",
                 )
-                await self._stream_once()
-                backoff = INITIAL_BACKOFF_S
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                msg = str(exc)
-                self._last_error = msg[:500]
-                dropped = self._drop_unsupported_schema(msg)
-                if dropped:
-                    self._dropped_schemas.append(dropped)
-                    logger.warning(
-                        "globex_live_dropping_schema",
-                        dropped=dropped,
-                        remaining=self._schemas,
-                    )
-                    if not self._schemas:
-                        logger.error("globex_live_no_schemas_left")
-                        return
-                    attempt -= 1
-                    continue
-                logger.exception("globex_live_stream_failed", error=msg)
-                if attempt >= MAX_RECONNECTS:
-                    logger.error("globex_live_giving_up", attempts=attempt)
+                return
+
+            connected = False
+            for candidate in candidates:
+                if self._stop.is_set():
                     return
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60.0)
+                try:
+                    logger.info(
+                        "globex_live_connecting",
+                        attempt=attempt,
+                        schemas=self._schemas,
+                        parents=self._parents,
+                        key_label=candidate.label,
+                        key_source=candidate.source,
+                    )
+                    # Bootstrap the registry on every candidate switch so the
+                    # in-memory map matches the key we're about to stream
+                    # against.
+                    await self._bootstrap_registry(candidate.api_key)
+                    self._active_key_label = candidate.label
+                    await self._stream_once(candidate)
+                    backoff = INITIAL_BACKOFF_S
+                    connected = True
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    msg = str(exc)
+                    self._last_error = msg[:500]
+                    dropped = self._drop_unsupported_schema(msg)
+                    if dropped:
+                        self._dropped_schemas.append(dropped)
+                        logger.warning(
+                            "globex_live_dropping_schema",
+                            dropped=dropped,
+                            remaining=self._schemas,
+                        )
+                        if not self._schemas:
+                            self._dead = True
+                            logger.error(
+                                "globex_live_no_schemas_left",
+                                hint=(
+                                    "register a key with appropriate "
+                                    "Databento entitlements"
+                                ),
+                            )
+                            return
+                        # Don't burn an attempt for a config-time fix.
+                        attempt -= 1
+                        connected = True
+                        break
+                    logger.exception(
+                        "globex_live_stream_failed",
+                        error=msg,
+                        key_label=candidate.label,
+                    )
+                    await self._record_candidate_error(candidate, msg)
+                    # Try the next candidate before consuming a reconnect.
+                    continue
+
+            if connected:
+                continue
+
+            if attempt >= MAX_RECONNECTS:
+                self._dead = True
+                logger.error(
+                    "globex_live_giving_up",
+                    attempts=attempt,
+                    hint="manual intervention required",
+                )
+                return
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
+
+    async def _resolve_candidates(self) -> list[KeyCandidate]:
+        """Resolve the prioritised candidate list (env first, then DB pool)."""
+        try:
+            factory = get_session_factory()
+            async with factory() as session:
+                return await iter_keys(session, DATASET)
+        except Exception:  # noqa: BLE001 — degrade to env-only on DB failure
+            logger.exception("globex_live_key_pool_resolve_failed")
+            env_key = self._settings.globex_api_key
+            if env_key:
+                return [
+                    KeyCandidate(
+                        label=f"env:{DATASET}",
+                        api_key=env_key,
+                        source="env",
+                    )
+                ]
+            return []
+
+    async def _record_candidate_error(
+        self, candidate: KeyCandidate, error_msg: str
+    ) -> None:
+        if candidate.source != "db":
+            return
+        try:
+            factory = get_session_factory()
+            async with factory() as session:
+                await record_key_error(session, candidate, error_msg=error_msg)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "globex_live_record_key_error_failed",
+                key_label=candidate.label,
+            )
+
+    async def _record_candidate_success(self, candidate: KeyCandidate) -> None:
+        if candidate.source != "db":
+            return
+        try:
+            factory = get_session_factory()
+            async with factory() as session:
+                await record_key_success(session, candidate)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "globex_live_record_key_success_failed",
+                key_label=candidate.label,
+            )
 
     def _drop_unsupported_schema(self, error_message: str) -> str | None:
         msg = error_message.lower()
@@ -229,9 +412,17 @@ class GlobexLiveIngester:
             ):
                 self._schemas.remove(schema)
                 return schema
+        # Fallback: the gateway changed its error format. Don't drop a
+        # schema speculatively but log loudly so operators can update.
+        if any(fragment in msg for fragment in _AUTH_ERROR_FRAGMENTS):
+            logger.warning(
+                "globex_schema_drop_unrecognized_error_format",
+                schemas_active=list(self._schemas),
+                error=error_message[:300],
+            )
         return None
 
-    async def _bootstrap_registry(self) -> None:
+    async def _bootstrap_registry(self, api_key: str | None = None) -> None:
         """Pre-populate ``self._registry`` from the historical definition schema.
 
         Live ``mbp-10`` / ``trades`` records carry only ``instrument_id``,
@@ -245,7 +436,11 @@ class GlobexLiveIngester:
         except ImportError:
             return
 
-        client = db.Historical(key=self._settings.globex_api_key)
+        key = api_key or self._settings.globex_api_key
+        if not key:
+            return
+
+        client = db.Historical(key=key)
         end = datetime.now(UTC) - timedelta(minutes=30)
         start = end - timedelta(days=_BOOTSTRAP_DAYS)
         loaded = 0
@@ -288,15 +483,15 @@ class GlobexLiveIngester:
                 loaded += 1
         logger.info("globex_registry_bootstrapped", contracts=loaded)
 
-    async def _stream_once(self) -> None:
+    async def _stream_once(self, candidate: KeyCandidate) -> None:
         import databento as db
 
         # First time only: pre-populate the registry so live trades on
         # ``mbp-10`` / ``trades`` schemas can be mapped to a contract.
         if not self._registry:
-            await self._bootstrap_registry()
+            await self._bootstrap_registry(candidate.api_key)
 
-        client = db.Live(key=self._settings.globex_api_key)
+        client = db.Live(key=candidate.api_key)
         for parent in self._parents:
             for schema in self._schemas:
                 try:
@@ -313,9 +508,13 @@ class GlobexLiveIngester:
                         parent=parent,
                     )
 
+        first_record_seen = False
         async for record in client:
             if self._stop.is_set():
                 break
+            if not first_record_seen:
+                first_record_seen = True
+                await self._record_candidate_success(candidate)
             try:
                 await self._handle_record(record)
             except Exception:  # noqa: BLE001
@@ -330,6 +529,31 @@ class GlobexLiveIngester:
         if self._first_record_at is None:
             self._first_record_at = datetime.now(UTC)
         self._last_record_at = datetime.now(UTC)
+        # Capture a snapshot of the first record of each type — invaluable for
+        # diagnostics. Use an explicit allowlist rather than ``dir(record)`` so
+        # ErrorMsg / SystemMsg frames don't leak auth tokens via diagnostics.
+        if rtype not in self._sample_record_attrs:
+            attrs: dict[str, Any] = {}
+            for name in _DIAGNOSTICS_ATTR_ALLOWLIST:
+                if not hasattr(record, name):
+                    continue
+                try:
+                    val = getattr(record, name)
+                except Exception:  # noqa: BLE001
+                    continue
+                if callable(val):
+                    continue
+                try:
+                    if isinstance(val, str | int | float | bool | type(None)):
+                        attrs[name] = val
+                    elif isinstance(val, list | tuple):
+                        attrs[name] = [str(x)[:200] for x in val[:3]]
+                    else:
+                        attrs[name] = str(val)[:200]
+                except Exception:  # noqa: BLE001
+                    attrs[name] = "<unserialisable>"
+            self._sample_record_attrs[rtype] = attrs
+
         if "Definition" in rtype:
             self._handle_definition(record)
         elif "Trade" in rtype:
@@ -385,6 +609,13 @@ class GlobexLiveIngester:
         instrument_id = getattr(record, "instrument_id", None)
         contract = self._registry.get(instrument_id) if instrument_id else None
         if contract is None:
+            self._unmatched_total += 1
+            if self._unmatched_total % 100 == 0:
+                logger.warning(
+                    "globex_trade_unmatched_rollup",
+                    unmatched_total=self._unmatched_total,
+                    registry_size=len(self._registry),
+                )
             return
 
         price = _scale_price(getattr(record, "price", None))
@@ -402,6 +633,16 @@ class GlobexLiveIngester:
         except (TypeError, ValueError):
             seq_int = 0
 
+        ts = _record_ts(record)
+        if ts is None:
+            self._dropped_no_ts_count += 1
+            logger.warning(
+                "globex_trade_dropped_no_ts",
+                instrument_id=instrument_id,
+                dropped_total=self._dropped_no_ts_count,
+            )
+            return
+
         # Map MDP 3.0 ``aggressor_side`` (1 = buy, 2 = sell, 0 = none) to our
         # +1 / -1 / null convention.
         aggressor_raw = getattr(record, "aggressor_side", None)
@@ -414,7 +655,7 @@ class GlobexLiveIngester:
 
         book = self._book.get(instrument_id, {})
         await self._tick_writer.add({
-            "ts": _record_ts(record),
+            "ts": ts,
             "symbol": contract["symbol"],
             "seq": seq_int,
             "price": price,
@@ -450,7 +691,7 @@ class GlobexLiveIngester:
                     "futures_price": float(price),
                     "cash_spot": cash_spot,
                     "basis": basis_value,
-                    "ts": _record_ts(record).isoformat().replace("+00:00", "Z"),
+                    "ts": ts.isoformat().replace("+00:00", "Z"),
                 }
                 get_tick_notifier().publish(cash_symbol, tick_payload)
             except Exception:  # noqa: BLE001 - never let stream fan-out break ingestion

@@ -1,4 +1,5 @@
 import { Navigate, Route, Routes } from "react-router-dom";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Layout } from "./components/Layout";
 import { useAuth } from "./lib/AuthContext";
 import { AccessRequestsPage } from "./pages/AccessRequests";
@@ -19,73 +20,75 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
 
 export function App() {
   return (
-    <Routes>
-      <Route path="/login" element={<LoginPage />} />
-      <Route
-        path="/"
-        element={
-          <ProtectedRoute>
-            <DashboardPage />
-          </ProtectedRoute>
-        }
-      />
-      <Route
-        path="/api-keys"
-        element={
-          <ProtectedRoute>
-            <ApiKeysPage />
-          </ProtectedRoute>
-        }
-      />
-      <Route
-        path="/access-requests"
-        element={
-          <ProtectedRoute>
-            <AccessRequestsPage />
-          </ProtectedRoute>
-        }
-      />
-      <Route
-        path="/system-status"
-        element={
-          <ProtectedRoute>
-            <SystemStatusPage />
-          </ProtectedRoute>
-        }
-      />
-      <Route
-        path="/data-inspector"
-        element={
-          <ProtectedRoute>
-            <DataInspectorPage />
-          </ProtectedRoute>
-        }
-      />
-      <Route
-        path="/databento-keys"
-        element={
-          <ProtectedRoute>
-            <DatabentoKeysPage />
-          </ProtectedRoute>
-        }
-      />
-      <Route
-        path="/live"
-        element={
-          <ProtectedRoute>
-            <LivePage />
-          </ProtectedRoute>
-        }
-      />
-      <Route
-        path="/0dte"
-        element={
-          <ProtectedRoute>
-            <ZeroDtePage />
-          </ProtectedRoute>
-        }
-      />
-      <Route path="*" element={<Navigate to="/" replace />} />
-    </Routes>
+    <ErrorBoundary>
+      <Routes>
+        <Route path="/login" element={<LoginPage />} />
+        <Route
+          path="/"
+          element={
+            <ProtectedRoute>
+              <DashboardPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/api-keys"
+          element={
+            <ProtectedRoute>
+              <ApiKeysPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/access-requests"
+          element={
+            <ProtectedRoute>
+              <AccessRequestsPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/system-status"
+          element={
+            <ProtectedRoute>
+              <SystemStatusPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/data-inspector"
+          element={
+            <ProtectedRoute>
+              <DataInspectorPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/databento-keys"
+          element={
+            <ProtectedRoute>
+              <DatabentoKeysPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/live"
+          element={
+            <ProtectedRoute>
+              <LivePage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/0dte"
+          element={
+            <ProtectedRoute>
+              <ZeroDtePage />
+            </ProtectedRoute>
+          }
+        />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </ErrorBoundary>
   );
 }

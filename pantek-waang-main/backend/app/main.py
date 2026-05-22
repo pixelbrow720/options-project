@@ -25,6 +25,7 @@ from app.api.endpoints import (
     public_data,
     snapshot,
     stream,
+    stream_ticket,
 )
 from app.config import get_settings
 from app.core.logging import configure_logging, get_logger
@@ -60,28 +61,19 @@ async def lifespan(app: FastAPI):
     configure_logging(settings.log_level)
     _install_uvicorn_log_redaction()
 
-    # ── Bright-marker WARNINGs for default secrets ───────────────────────
-    # We only WARN (not raise) so dev / CI keeps running with the bundled
-    # defaults. In production these MUST be rotated — the warnings appear
-    # in the application log on every startup so operators see them.
+    # ── Production guardrails ────────────────────────────────────────────
+    # In non-test mode, refuse to boot with default ADMIN_PASSWORD or
+    # JWT_SECRET. The bundled defaults are safe for local dev only —
+    # leaving them in place on a publicly reachable instance is a
+    # critical vulnerability, so we fail closed.
     if not _testing_mode():
         if is_default_admin_password(settings.admin_password):
-            logger.warning(
-                "WARNING_DEFAULT_ADMIN_PASSWORD",
-                detail=(
-                    "ADMIN_PASSWORD is unset or matches a known default. "
-                    "Set ADMIN_PASSWORD in .env to a secure random value "
-                    "before exposing this server publicly."
-                ),
+            raise RuntimeError(
+                "ADMIN_PASSWORD is unset or default; refusing to start in production mode"
             )
         if is_default_jwt_secret(settings.jwt_secret):
-            logger.warning(
-                "WARNING_DEFAULT_JWT_SECRET",
-                detail=(
-                    "JWT_SECRET is unset or matches a known default. "
-                    "Set JWT_SECRET in .env to a secure random value "
-                    "(see SECURITY.md) before exposing this server publicly."
-                ),
+            raise RuntimeError(
+                "JWT_SECRET is unset or default; refusing to start in production mode"
             )
         if (
             settings.public_session_jwt_secret
@@ -310,7 +302,19 @@ class _SecurityHeadersMiddleware:
 # uvicorn loggers that scrubs ``token=...`` and ``key=...`` query
 # parameters before the line reaches a handler.
 
-_SENSITIVE_QUERY_KEYS = ("token", "key", "code", "state", "access_token", "refresh_token")
+_SENSITIVE_QUERY_KEYS = (
+    "token",
+    "key",
+    "code",
+    "state",
+    "access_token",
+    "refresh_token",
+    "api_key",
+    "apikey",
+    "password",
+    "client_secret",
+    "bot_token",
+)
 _REDACTED = "REDACTED"
 _QUERY_REDACT_RE = re.compile(
     r"([?&](?:" + "|".join(_SENSITIVE_QUERY_KEYS) + r")=)[^&\s\"]+",
@@ -424,6 +428,7 @@ def create_app() -> FastAPI:
     # ``data.py``. Route order matters: Starlette matches in declaration order.
     app.include_router(snapshot.router)
     app.include_router(stream.router)
+    app.include_router(stream_ticket.router)
     app.include_router(flow.router)
     app.include_router(hiro.router)
     app.include_router(data.router)

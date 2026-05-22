@@ -16,15 +16,18 @@ import {
 } from "@/components/ui/table";
 import { Status, type HealthResponse, type SystemStatus } from "@/lib/api";
 import { formatDateTime, formatRelative } from "@/lib/utils";
+import { useTabVisible } from "@/lib/visibility";
 
 export function SystemStatusPage() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [system, setSystem] = useState<SystemStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const visible = useTabVisible();
 
   useEffect(() => {
     let cancelled = false;
     async function load() {
+      if (!visible) return;
       try {
         const [h, s] = await Promise.all([Status.health(), Status.system()]);
         if (cancelled) return;
@@ -42,7 +45,7 @@ export function SystemStatusPage() {
       cancelled = true;
       clearInterval(id);
     };
-  }, []);
+  }, [visible]);
 
   const symbols = health?.supported_symbols ?? [];
 

@@ -33,6 +33,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useAuth } from "@/lib/auth";
 import { useLiveStream } from "@/lib/stream";
 import { useTickStream, type TickFrame } from "@/lib/tickStream";
+import { useTabVisible } from "@/lib/visibility";
 import {
   SymbolData,
   describeApiError,
@@ -112,6 +113,12 @@ export default function Dashboard() {
 
   const stream = useLiveStream(symbol, token);
   const tickStream = useTickStream(symbol, token);
+  const tabVisible = useTabVisible();
+  // Stable ref so pollers can read the current visibility without re-running
+  // their effect every time the tab focus changes (which would tear down and
+  // re-mount every interval).
+  const tabVisibleRef = useRef(tabVisible);
+  tabVisibleRef.current = tabVisible;
 
   useEffect(() => {
     if (params.symbol?.toUpperCase() !== symbol) {
@@ -151,6 +158,7 @@ export default function Dashboard() {
     if (!token) return;
     let cancelled = false;
     const id = setInterval(async () => {
+      if (!tabVisibleRef.current) return;
       try {
         const env = await SymbolData.snapshot(symbol);
         if (cancelled) return;
@@ -164,7 +172,10 @@ export default function Dashboard() {
     return () => { cancelled = true; clearInterval(id); };
   }, [symbol, token]);
 
-  // Generic poller helper
+  // Generic poller helper. Skips the periodic call (but not the cold start)
+  // when the tab is hidden — saves bandwidth and avoids stacking up requests
+  // that all complete the moment the user returns. The first call still runs
+  // immediately on mount so the panel has data the moment it appears.
   function usePoller<T>(
     fn: () => Promise<T>,
     setter: (v: T) => void,
@@ -180,7 +191,10 @@ export default function Dashboard() {
         } catch { /* keep prior */ }
       }
       run();
-      const id = setInterval(run, intervalMs);
+      const id = setInterval(() => {
+        if (!tabVisibleRef.current) return;
+        run();
+      }, intervalMs);
       return () => { cancelled = true; clearInterval(id); };
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, deps);

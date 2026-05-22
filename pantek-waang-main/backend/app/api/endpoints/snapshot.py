@@ -30,7 +30,7 @@ from app.processing.session import session_snapshot
 router = APIRouter()
 
 
-_SYMBOL_PATTERN = r"^[A-Za-z0-9_.-]+$"
+_SYMBOL_PATTERN = r"^[A-Z][A-Z0-9]{0,11}$"
 
 
 async def build_snapshot_payload(session: AsyncSession, symbol: str) -> tuple[dict[str, Any], datetime | None]:

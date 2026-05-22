@@ -6,6 +6,7 @@ import {
   ShieldAlert,
   Zap,
 } from "lucide-react";
+import axios from "axios";
 import { useEffect, useMemo, useState } from "react";
 import {
   Card,
@@ -28,6 +29,7 @@ import {
   type InspectorLatestMetric,
 } from "@/lib/api";
 import { cn, formatDateTime, formatRelative } from "@/lib/utils";
+import { useTabVisible } from "@/lib/visibility";
 
 const REFRESH_INTERVAL_MS = 30_000;
 
@@ -73,17 +75,25 @@ export function DataInspectorPage() {
   const [payload, setPayload] = useState<InspectorPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const visible = useTabVisible();
 
   useEffect(() => {
+    const ctl = new AbortController();
     let cancelled = false;
     async function load() {
+      // Skip the network round-trip if the tab is hidden — no point fetching
+      // 30s-stale data the user can't see, and it eases backend load when
+      // dozens of dashboards sit idle in background tabs.
+      if (!visible) return;
       try {
-        const data = await Inspector.load();
+        const data = await Inspector.load(ctl.signal);
         if (cancelled) return;
         setPayload(data);
         setError(null);
       } catch (err) {
         if (cancelled) return;
+        // Aborted requests are expected on unmount; surface only real errors.
+        if (axios.isCancel(err)) return;
         setError((err as Error).message ?? "Failed to load");
       } finally {
         if (!cancelled) setLoading(false);
@@ -93,9 +103,10 @@ export function DataInspectorPage() {
     const id = setInterval(load, REFRESH_INTERVAL_MS);
     return () => {
       cancelled = true;
+      ctl.abort();
       clearInterval(id);
     };
-  }, []);
+  }, [visible]);
 
   const gexVol = useMemo(
     () => payload?.latest_metrics.filter((m) => m.metric_type === "GEX_NET_TOTAL_VOL") ?? [],

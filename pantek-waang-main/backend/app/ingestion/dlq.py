@@ -41,15 +41,35 @@ class DeadLetterQueue:
         self._buffer: deque[dict[str, Any]] = deque(maxlen=capacity)
         self._lock = asyncio.Lock()
         self._flush_interval_s = 5.0
+        # Counter incremented every time an append evicts the oldest entry
+        # because the buffer was already at ``maxlen``. Surfaced via
+        # :meth:`evicted_count` so operators can spot DLQ saturation.
+        self._evicted_count: int = 0
+        # Holding slot for a batch whose DB-flush failed. Re-prepending into
+        # the deque under load loses entries to ``maxlen``; instead we keep
+        # the failed batch here and replay on the next flush tick.
+        self._pending_retry: list[dict[str, Any]] = []
 
     @property
     def pending(self) -> int:
-        return len(self._buffer)
+        return len(self._buffer) + len(self._pending_retry)
+
+    def evicted_count(self) -> int:
+        """Total entries dropped because the in-memory buffer was full."""
+        return self._evicted_count
 
     async def add(
         self, *, source: str, reason: str, payload: dict | None = None
     ) -> None:
         async with self._lock:
+            # Detect whether this append will evict the oldest entry — the
+            # deque silently drops it under ``maxlen`` so we have to check
+            # before mutating to keep the metric accurate.
+            if (
+                self._buffer.maxlen is not None
+                and len(self._buffer) == self._buffer.maxlen
+            ):
+                self._evicted_count += 1
             self._buffer.append(
                 {
                     "ts": datetime.now(UTC),
@@ -63,14 +83,20 @@ class DeadLetterQueue:
             source=source,
             reason=reason,
             pending=self.pending,
+            evicted_total=self._evicted_count,
         )
 
     async def flush(self) -> int:
         async with self._lock:
-            if not self._buffer:
+            # Drain pending_retry first so the oldest failed batch goes out
+            # ahead of newer entries.
+            batch: list[dict[str, Any]] = list(self._pending_retry)
+            self._pending_retry = []
+            if self._buffer:
+                batch.extend(self._buffer)
+                self._buffer.clear()
+            if not batch:
                 return 0
-            batch = list(self._buffer)
-            self._buffer.clear()
 
         try:
             factory = get_session_factory()
@@ -80,10 +106,11 @@ class DeadLetterQueue:
                 await session.commit()
         except Exception:  # noqa: BLE001 — DLQ failure must never propagate
             logger.exception("dlq_flush_failed", rows=len(batch))
-            # Best-effort: push the entries back so we try again next tick.
+            # Park the failed batch in the retry slot rather than re-prepending
+            # into the bounded deque (which would lose entries to ``maxlen``
+            # under sustained backpressure). The next flush tick replays it.
             async with self._lock:
-                for entry in reversed(batch):
-                    self._buffer.appendleft(entry)
+                self._pending_retry = batch + self._pending_retry
             return 0
         return len(batch)
 

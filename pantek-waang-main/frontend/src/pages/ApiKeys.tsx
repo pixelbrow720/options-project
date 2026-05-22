@@ -106,6 +106,7 @@ export function ApiKeysPage() {
   }
 
   async function remove(row: ApiKeySummary) {
+    // TODO(ux): replace with Radix AlertDialog for consistent styling.
     if (!confirm(`Revoke key "${row.label}"? This cannot be undone.`)) return;
     try {
       await ApiKeys.remove(row.id);

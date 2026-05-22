@@ -16,15 +16,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link rel="dns-prefetch" href="https://fonts.googleapis.com" />
     <link rel="dns-prefetch" href="https://fonts.gstatic.com" />
-    <!--
-      Pre-warm the TCP+TLS handshake to the backend tunnel before any axios
-      request fires. Trims ~1 RTT from the first API call (login, /me) for
-      users far from us-east-1 (Cloudflare edge for trycloudflare.com).
-      The tunnel hostname is the production default; if it rotates, this
-      becomes a no-op (the connection is just unused).
-    -->
-    <link rel="preconnect" href="https://roster-depends-admissions-epic.trycloudflare.com" crossorigin />
-    <link rel="dns-prefetch" href="https://roster-depends-admissions-epic.trycloudflare.com" />
+    <!-- preconnect dynamically configured at runtime via VITE_API_BASE_URL -->
     <link
       rel="stylesheet"
       href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"

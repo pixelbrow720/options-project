@@ -110,6 +110,11 @@ export function HistoricalReplay({
         return;
       }
       onSeek(points[nextIdx].ts);
+      // TODO(perf): seekTs is lifted via onSeek at 500ms cadence. Today the
+      // chart consumers re-render lazily, but if a future consumer subscribes
+      // to seekTs in a tight render path this becomes a footgun. If you see
+      // jank when scrubbing, throttle/coalesce seeks at the chart level
+      // (e.g. requestAnimationFrame) rather than here.
     }, 500);
     return () => {
       if (playTimer.current) {

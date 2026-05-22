@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import secrets
+import threading
 import time
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import UTC, datetime, timedelta
@@ -93,7 +94,14 @@ def is_default_jwt_secret(secret: str | None) -> bool:
     """
     if secret is None:
         return True
-    return secret in DEFAULT_JWT_SECRET_VALUES
+    if secret in DEFAULT_JWT_SECRET_VALUES:
+        return True
+    if len(secret) < 32:
+        return True
+    return False
+
+
+ADMIN_TOKEN_TYPE = "admin"
 
 
 def create_jwt_token(subject: str, *, expires_minutes: int | None = None) -> str:
@@ -102,6 +110,7 @@ def create_jwt_token(subject: str, *, expires_minutes: int | None = None) -> str
     exp = now + timedelta(minutes=expires_minutes or settings.jwt_expire_minutes)
     payload = {
         "sub": subject,
+        "typ": ADMIN_TOKEN_TYPE,
         "iat": int(now.timestamp()),
         "exp": int(exp.timestamp()),
     }
@@ -110,7 +119,17 @@ def create_jwt_token(subject: str, *, expires_minutes: int | None = None) -> str
 
 def decode_jwt_token(token: str) -> dict:
     settings = get_settings()
-    return jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+    payload = jwt.decode(
+        token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
+    )
+    # Verify ``typ`` only when present so legacy tokens issued before
+    # this guard was added keep working until they expire. New tokens
+    # always carry ``typ=admin`` so cross-use with public-session tokens
+    # (which carry ``typ=public_session``) is rejected.
+    typ = payload.get("typ")
+    if typ is not None and typ != ADMIN_TOKEN_TYPE:
+        raise jwt.InvalidTokenError("Wrong token type")
+    return payload
 
 
 # ── Rev 5: public-session JWTs + Discord OAuth state tokens ────────────────
@@ -184,12 +203,19 @@ def _state_secret() -> bytes:
 
 
 def create_discord_state_token(*, now: datetime | None = None) -> str:
-    """Return a fresh signed state token for the Discord OAuth flow."""
+    """Return a fresh signed state token for the Discord OAuth flow.
+
+    Also registers the embedded nonce in the server-side single-use
+    store so the matching ``/callback`` request can verify the flow
+    actually originated from a ``/start`` we issued.
+    """
     moment = now or datetime.now(UTC)
     ts = str(int(moment.timestamp())).encode("ascii")
     nonce = secrets.token_bytes(16)
-    payload = _b64u_encode(ts) + _STATE_DELIMITER + _b64u_encode(nonce)
+    nonce_b = _b64u_encode(nonce)
+    payload = _b64u_encode(ts) + _STATE_DELIMITER + nonce_b
     sig = hmac.new(_state_secret(), payload, sha256).digest()
+    register_discord_state_nonce(nonce_b.decode("ascii"))
     return (payload + _STATE_DELIMITER + _b64u_encode(sig)).decode("ascii")
 
 
@@ -231,3 +257,70 @@ DEFAULT_DISCORD_STATE_TTL_SECONDS = _DEFAULT_STATE_TTL_SECONDS
 
 def _now_ts() -> int:  # pragma: no cover - trivial
     return int(time.time())
+
+
+# ── Single-use state nonce store ──────────────────────────────────────────
+#
+# The signed state token above proves the callback was kicked off by
+# *some* /start invocation against this deployment, but on its own does
+# not bind the callback to the specific browser tab that initiated the
+# flow. To raise the bar for state replay / CSRF, we additionally store
+# each issued nonce server-side and pop it on the matching callback.
+#
+# This is an in-memory dict guarded by a threading.Lock — fine for a
+# single-process deployment. For multi-process (gunicorn workers > 1)
+# or horizontally scaled deployments this should move to Redis with a
+# short TTL.
+
+_NONCE_STORE: dict[str, float] = {}
+_NONCE_LOCK = threading.Lock()
+
+
+def _purge_expired_nonces(now: float) -> None:
+    expired = [n for n, exp in _NONCE_STORE.items() if exp < now]
+    for n in expired:
+        _NONCE_STORE.pop(n, None)
+
+
+def register_discord_state_nonce(
+    nonce: str,
+    *,
+    ttl_seconds: int = _DEFAULT_STATE_TTL_SECONDS,
+) -> None:
+    """Record a nonce so the matching callback can consume it once."""
+    if not nonce:
+        return
+    expiry = time.time() + float(ttl_seconds)
+    with _NONCE_LOCK:
+        _purge_expired_nonces(time.time())
+        _NONCE_STORE[nonce] = expiry
+
+
+def consume_discord_state_nonce(nonce: str) -> bool:
+    """Atomically validate + remove a nonce. Returns True iff present and unexpired."""
+    if not nonce:
+        return False
+    now = time.time()
+    with _NONCE_LOCK:
+        _purge_expired_nonces(now)
+        expiry = _NONCE_STORE.pop(nonce, None)
+    if expiry is None:
+        return False
+    return expiry >= now
+
+
+def reset_discord_state_nonces() -> None:
+    """Test helper: drop all in-memory nonces."""
+    with _NONCE_LOCK:
+        _NONCE_STORE.clear()
+
+
+def extract_discord_state_nonce(token: str) -> str | None:
+    """Return the base64 nonce segment from a state token, or None."""
+    if not token or not isinstance(token, str):
+        return None
+    try:
+        _ts_b, nonce_b, _sig_b = token.encode("ascii").split(_STATE_DELIMITER)
+    except ValueError:
+        return None
+    return nonce_b.decode("ascii")

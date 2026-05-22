@@ -19,9 +19,16 @@ website surfaces this as a "vol crush" (ratio < 0.5) or "vol expansion"
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 
 import numpy as np
 import pandas as pd
+
+from app.processing.session import _now_eastern
+
+
+def _today_eastern() -> date:
+    return _now_eastern().date()
 
 
 @dataclass
@@ -45,8 +52,16 @@ def compute_move_tracker(
     ``chain`` is the latest options chain DataFrame with columns
     ``strike, expiration, option_type, last_price, underlying_price``.
 
-    ``open_price`` is the underlying's session-opening price (caller's
-    responsibility — the chain DataFrame doesn't carry it).
+    ``open_price`` is the underlying's session-opening price. When the
+    caller cannot supply one (the chain DataFrame doesn't carry a
+    historical series — :mod:`app.processing.pipeline` overwrites
+    ``underlying_price`` with the *current* spot before invoking us)
+    ``realized_move`` is left as ``None`` so the website surfaces a
+    "no realized move yet" state instead of a silent zero.
+
+    TODO: wire the 09:30 ET print in from a session-open hook
+    (``reset_session_state`` is the natural place) so realized_move is
+    populated for every tick after the first.
     """
     if chain.empty:
         return MoveSnapshot(None, open_price, None, None, None, None)
@@ -61,10 +76,9 @@ def compute_move_tracker(
         realized = abs(S - open_price)
 
     if today is None:
-        today = pd.Timestamp.utcnow()
-        if today.tzinfo is not None:
-            today = today.tz_convert(None)
-    today_d = today.date() if hasattr(today, "date") else today
+        today_d = _today_eastern()
+    else:
+        today_d = today.date() if hasattr(today, "date") else today
 
     work = chain.copy()
     work["last_price"] = pd.to_numeric(work["last_price"], errors="coerce")

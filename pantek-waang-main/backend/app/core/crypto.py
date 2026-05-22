@@ -61,7 +61,11 @@ def _derive_fernet_key(jwt_secret: str) -> bytes:
 def _get_fernet() -> Fernet:
     """Cached Fernet instance derived from current settings."""
     settings = get_settings()
-    secret = settings.jwt_secret or "dev-only-change-me"
+    secret = (settings.jwt_secret or "").strip()
+    if not secret:
+        raise RuntimeError(
+            "JWT_SECRET must be set to use the encrypted key pool"
+        )
     return Fernet(_derive_fernet_key(secret))
 
 

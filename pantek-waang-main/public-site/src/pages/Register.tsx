@@ -8,7 +8,21 @@ import { Auth, describeApiError } from "@/lib/api";
 import { toast } from "@/components/ui/toast";
 import { useTheme } from "@/hooks/useTheme";
 
-const ADMINS = ["@nods911_", "@arveloon", "@iqbal4o4"] as const;
+const DEFAULT_ADMINS = ["@nods911_", "@arveloon", "@iqbal4o4"] as const;
+// Operators can override the comma-separated handle list at build time via
+// VITE_DISCORD_CONTACT_HANDLES so we don't have to redeploy the bundle to
+// rotate an admin (or scrub one who has left). Empty/whitespace entries are
+// dropped; if the env is unset or the parsed list is empty we fall back to
+// the defaults.
+const ADMINS: readonly string[] = (() => {
+  const raw = import.meta.env.VITE_DISCORD_CONTACT_HANDLES as string | undefined;
+  if (!raw) return DEFAULT_ADMINS;
+  const parsed = raw
+    .split(",")
+    .map((h) => h.trim())
+    .filter((h) => h.length > 0);
+  return parsed.length > 0 ? parsed : DEFAULT_ADMINS;
+})();
 const DISCORD_INVITE = "https://discord.gg/dy78P5vP62";
 
 interface Step {

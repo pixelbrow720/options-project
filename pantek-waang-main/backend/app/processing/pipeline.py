@@ -475,17 +475,35 @@ async def _persist_metrics(
         )
 
     # ── Pin probability heatmap (one row per 0DTE strike) ────────────────
-    for entry in result.pin_probability:
+    if result.pin_probability:
+        for entry in result.pin_probability:
+            rows.append(
+                {
+                    "ts": ts,
+                    "symbol": symbol,
+                    "metric_type": "PIN_PROBABILITY",
+                    "strike": entry["strike"],
+                    "expiration": sentinel_expiry,
+                    "computed_at": ts,
+                    "value": entry["prob"],
+                    "extra_json": entry,
+                }
+            )
+    elif not is_expiration_day(symbol):
+        # Sentinel row so EXPECTED_METRIC_TYPES sees PIN_PROBABILITY
+        # even on non-0DTE days. Subscribers can distinguish "no 0DTE
+        # today" (value is None + reason populated) from "computation
+        # failed" (metric type missing entirely).
         rows.append(
             {
                 "ts": ts,
                 "symbol": symbol,
                 "metric_type": "PIN_PROBABILITY",
-                "strike": entry["strike"],
+                "strike": 0,
                 "expiration": sentinel_expiry,
                 "computed_at": ts,
-                "value": entry["prob"],
-                "extra_json": entry,
+                "value": None,
+                "extra_json": {"reason": "no_0dte_today"},
             }
         )
 

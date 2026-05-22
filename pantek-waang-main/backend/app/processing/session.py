@@ -84,13 +84,74 @@ def _rth_window() -> tuple[time, time]:
     )
 
 
+# NYSE-observed full-day closures, hardcoded for 2025-2028. We bake this
+# in because the public ``holidays`` package falls back to the US federal
+# calendar — which is **not** a strict superset of NYSE (Columbus Day and
+# Veterans Day are federal holidays but NYSE trades them). Using the
+# federal list as a fallback over-closes the pipeline. Half-day early
+# closes are intentionally not treated as full holidays here; we keep
+# the session open and accept that the last hour of a half day is
+# liquidity-thin.
+_NYSE_HOLIDAYS_HARDCODED: Final[frozenset[date]] = frozenset(
+    {
+        # 2025
+        date(2025, 1, 1),    # New Year's Day
+        date(2025, 1, 20),   # MLK Day
+        date(2025, 2, 17),   # Washington's Birthday
+        date(2025, 4, 18),   # Good Friday
+        date(2025, 5, 26),   # Memorial Day
+        date(2025, 6, 19),   # Juneteenth
+        date(2025, 7, 4),    # Independence Day
+        date(2025, 9, 1),    # Labor Day
+        date(2025, 11, 27),  # Thanksgiving
+        date(2025, 12, 25),  # Christmas
+        # 2026
+        date(2026, 1, 1),
+        date(2026, 1, 19),
+        date(2026, 2, 16),
+        date(2026, 4, 3),
+        date(2026, 5, 25),
+        date(2026, 6, 19),
+        date(2026, 7, 3),    # observed
+        date(2026, 9, 7),
+        date(2026, 11, 26),
+        date(2026, 12, 25),
+        # 2027
+        date(2027, 1, 1),
+        date(2027, 1, 18),
+        date(2027, 2, 15),
+        date(2027, 3, 26),
+        date(2027, 5, 31),
+        date(2027, 6, 18),   # observed (19th = Sat)
+        date(2027, 7, 5),    # observed (4th = Sun)
+        date(2027, 9, 6),
+        date(2027, 11, 25),
+        date(2027, 12, 24),  # observed (25th = Sat)
+        # 2028
+        date(2028, 1, 17),   # MLK Day (Jan 1 is Sat, no NYE-Mon obs)
+        date(2028, 2, 21),
+        date(2028, 4, 14),
+        date(2028, 5, 29),
+        date(2028, 6, 19),
+        date(2028, 7, 4),
+        date(2028, 9, 4),
+        date(2028, 11, 23),
+        date(2028, 12, 25),
+    }
+)
+
+
 @lru_cache(maxsize=1)
-def _us_market_holidays() -> holidays.HolidayBase:
+def _us_market_holidays() -> holidays.HolidayBase | frozenset[date]:
     """Return a cached US market holiday calendar.
 
-    We prefer the dedicated NYSE / CBOE calendars when the ``holidays``
-    package version available exposes them; otherwise we fall back to the
-    federal US calendar which is a strict superset for full-day closures.
+    We prefer the dedicated NYSE / CBOE calendar exposed by the
+    ``holidays`` package when the installed version provides it. When it
+    doesn't (older packages don't expose ``holidays.NYSE``), we fall
+    back to a hardcoded 2025-2028 NYSE table rather than the federal
+    ``holidays.UnitedStates`` calendar — the federal list incorrectly
+    closes Columbus Day and Veterans Day, which would over-close the
+    pipeline on regular trading days.
     """
     nyse = getattr(holidays, "NYSE", None)
     if callable(nyse):
@@ -98,9 +159,7 @@ def _us_market_holidays() -> holidays.HolidayBase:
             return nyse(years=range(date.today().year - 1, date.today().year + 3))
         except Exception:  # noqa: BLE001
             pass
-    return holidays.UnitedStates(  # type: ignore[no-any-return]
-        years=range(date.today().year - 1, date.today().year + 3)
-    )
+    return _NYSE_HOLIDAYS_HARDCODED
 
 
 def _is_business_day(d: date) -> bool:

@@ -27,10 +27,17 @@ probability descending.
 
 from __future__ import annotations
 
+from datetime import date
+
 import numpy as np
 import pandas as pd
 
 from app.processing import bsm
+from app.processing.session import _now_eastern, time_to_expiry_0dte_years
+
+
+def _today_eastern() -> date:
+    return _now_eastern().date()
 
 
 def compute_pin_probability(
@@ -40,11 +47,18 @@ def compute_pin_probability(
     sigma_floor: float = 1e-4,
     charm_weight: float = 0.5,
     risk_free_rate: float = 0.05,
+    tau_years: float | None = None,
 ) -> list[dict]:
     """Return a probability-weighted list of 0DTE pin candidates.
 
     Required columns: ``strike, expiration, option_type, oi, iv,
     underlying_price``. ``charm`` is computed analytically inside.
+
+    ``tau_years`` overrides the session-aware τ used when computing charm.
+    Pass ``None`` (default) to derive τ from
+    :func:`app.processing.session.time_to_expiry_0dte_years`, floored at
+    one day to keep the BSM expressions numerically stable as expiry
+    approaches.
     """
     needed = {"strike", "expiration", "option_type", "oi", "iv", "underlying_price"}
     if df.empty or not needed.issubset(df.columns):
@@ -56,10 +70,9 @@ def compute_pin_probability(
     S = float(spot_series.iloc[-1])
 
     if today is None:
-        today = pd.Timestamp.utcnow()
-        if today.tzinfo is not None:
-            today = today.tz_convert(None)
-    today_d = today.date() if hasattr(today, "date") else today
+        today_d = _today_eastern()
+    else:
+        today_d = today.date() if hasattr(today, "date") else today
 
     # 0DTE-only filter.
     work = df.copy()
@@ -82,9 +95,12 @@ def compute_pin_probability(
     if work.empty:
         return []
 
-    # Use a 1-day floor for tau so charm doesn't blow up when we compute
-    # at session open (intra-day, fractional days remaining is fine).
-    tau = max(1, 1) / 365.0
+    # Session-aware τ, floored at one day so charm doesn't blow up as
+    # expiry approaches (τ → 0 makes (r - q)/(σ√τ) and d2/(2τ) explode).
+    if tau_years is None:
+        tau = max(1.0 / 365.0, time_to_expiry_0dte_years())
+    else:
+        tau = max(1.0 / 365.0, float(tau_years))
 
     K = work["strike"].to_numpy(dtype=float)
     sigma = work["iv"].to_numpy(dtype=float)

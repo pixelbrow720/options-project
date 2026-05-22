@@ -28,3 +28,20 @@ export function formatRelative(value: string | null | undefined): string {
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
 }
+
+// Always render market timestamps in America/New_York so users in other
+// time zones see the same wall-clock as the cash session.
+export function formatTimeET(value: string | Date | null | undefined): string {
+  if (!value) return "—";
+  const d = typeof value === "string" ? new Date(value) : value;
+  if (isNaN(d.getTime())) return "—";
+  return (
+    new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).format(d) + " ET"
+  );
+}

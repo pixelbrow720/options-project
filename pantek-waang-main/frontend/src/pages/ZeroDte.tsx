@@ -24,6 +24,8 @@ import {
   type GexStrike,
   type SpotSource,
 } from "@/lib/streamClient";
+import { formatTimeET } from "@/lib/utils";
+import { useTabVisible } from "@/lib/visibility";
 
 // ── Symbol-specific formatting ────────────────────────────────────────────
 
@@ -168,6 +170,7 @@ function sourcePill(source: SpotSource | string | null | undefined) {
 function ZeroDteInner() {
   const { symbol, apiKey, setSymbol, setApiKey, snapshot, status, lastFrameAt } =
     useLiveSnapshot();
+  const visible = useTabVisible();
 
   const [draftKey, setDraftKey] = useState<string>(apiKey);
   useEffect(() => setDraftKey(apiKey), [apiKey]);
@@ -187,6 +190,9 @@ function ZeroDteInner() {
     let timer: ReturnType<typeof setInterval> | null = null;
 
     const fetchOnce = async () => {
+      // Pause polling while the tab is hidden — futures levels are 30s
+      // refreshed and the user won't see them anyway.
+      if (!visible) return;
       try {
         setFuturesLoading(true);
         const data = await FuturesLevels.load(symbol, apiKey);
@@ -211,7 +217,7 @@ function ZeroDteInner() {
       cancelled = true;
       if (timer !== null) clearInterval(timer);
     };
-  }, [symbol, apiKey]);
+  }, [symbol, apiKey, visible]);
 
   const data = snapshot?.data;
   const sess = data?.session_state;
@@ -269,7 +275,7 @@ function ZeroDteInner() {
             {snapshot?.computed_at && (
               <>
                 {" "}
-                · last frame {new Date(snapshot.computed_at).toLocaleTimeString()}
+                · last frame {formatTimeET(snapshot.computed_at)}
               </>
             )}
           </p>

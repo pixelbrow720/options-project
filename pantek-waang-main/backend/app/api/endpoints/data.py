@@ -25,7 +25,7 @@ from app.db.session import get_db
 router = APIRouter()
 
 
-_SYMBOL_PATTERN = r"^[A-Za-z0-9_.-]+$"
+_SYMBOL_PATTERN = r"^[A-Z][A-Z0-9]{0,11}$"
 
 # GEX metric type per mode.
 _GEX_METRIC_BY_MODE: dict[str, str] = {

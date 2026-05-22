@@ -1,10 +1,16 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { motion, useReducedMotion } from "framer-motion";
 import { AlertTriangle } from "lucide-react";
 import { Layout } from "@/components/Layout";
 import { useAuth } from "@/lib/auth";
 import { useTheme } from "@/hooks/useTheme";
+import { destinationForStatus } from "@/lib/redirects";
+
+// Discord OAuth errors are echoed back into the URL by the backend. They
+// can in theory be arbitrarily long if a misconfigured proxy concatenates
+// them. Cap before rendering so a giant error string can't blow up layout.
+const ERROR_PARAM_MAX = 256;
 
 export default function AuthCallback() {
   // Apply data-theme even when landing directly here.
@@ -18,10 +24,28 @@ export default function AuthCallback() {
   const [phase, setPhase] = useState<"working" | "error">("working");
   const [error, setError] = useState<string | null>(null);
 
+  // Capture the relevant query params ONCE so the effect's second invocation
+  // under React.StrictMode (or any subsequent re-render that swaps `params`)
+  // doesn't re-read a token that we already replaced out of the URL bar.
+  const initial = useMemo(() => {
+    return {
+      token: params.get("token"),
+      error: params.get("error"),
+      status: params.get("status"),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // StrictMode in dev mounts every effect twice. Without this guard we
+  // would call /me with the token twice, which is harmless but logs a
+  // confusing duplicate request and can race the navigate() call.
+  const consumed = useRef(false);
+
   useEffect(() => {
-    const token = params.get("token");
-    const errParam = params.get("error");
-    const statusParam = params.get("status");
+    if (consumed.current) return;
+    consumed.current = true;
+
+    const { token, error: errParam, status: statusParam } = initial;
 
     // Strip sensitive query params from the visible URL ASAP so the JWT
     // doesn't end up in browser history, the Referer header on the next
@@ -41,7 +65,13 @@ export default function AuthCallback() {
       // Discord/back-end-supplied error strings are rendered as plain text
       // (React escapes by default), but we still keep the value short and
       // never pass it to dangerouslySetInnerHTML.
-      setError(decodeURIComponent(errParam));
+      let decoded: string;
+      try {
+        decoded = decodeURIComponent(errParam);
+      } catch {
+        decoded = errParam;
+      }
+      setError(decoded.slice(0, ERROR_PARAM_MAX));
       return;
     }
 
@@ -66,17 +96,16 @@ export default function AuthCallback() {
       if (cancelled) return;
       if (!result.ok) {
         setPhase("error");
-        setError(result.error);
+        setError(result.error.slice(0, ERROR_PARAM_MAX));
         return;
       }
-      const dest = redirectFor(result.status);
-      navigate(dest, { replace: true });
+      navigate(destinationForStatus(result.status), { replace: true });
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [params, consumeToken, navigate]);
+  }, [initial, consumeToken, navigate]);
 
   return (
     <Layout variant="marketing">
@@ -214,10 +243,3 @@ export default function AuthCallback() {
   );
 }
 
-function redirectFor(status: string): string {
-  if (status === "approved") return "/dashboard";
-  if (status === "pending") return "/pending";
-  if (status === "rejected") return "/rejected";
-  if (status === "banned") return "/login";
-  return "/dashboard";
-}
