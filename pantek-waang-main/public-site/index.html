@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en" class="dark" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b0d12" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <meta name="description" content="FlowOptionID — 0DTE flow analytics for SPX & NDX, with futures-translated key levels." />
+    <meta property="og:title" content="FlowOptionID — 0DTE Options Flow" />
+    <meta property="og:description" content="0DTE flow analytics for SPX & NDX, with futures-translated key levels." />
+    <meta property="og:type" content="website" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="dns-prefetch" href="https://fonts.googleapis.com" />
+    <link rel="dns-prefetch" href="https://fonts.gstatic.com" />
+    <!--
+      Pre-warm the TCP+TLS handshake to the backend tunnel before any axios
+      request fires. Trims ~1 RTT from the first API call (login, /me) for
+      users far from us-east-1 (Cloudflare edge for trycloudflare.com).
+      The tunnel hostname is the production default; if it rotates, this
+      becomes a no-op (the connection is just unused).
+    -->
+    <link rel="preconnect" href="https://roster-depends-admissions-epic.trycloudflare.com" crossorigin />
+    <link rel="dns-prefetch" href="https://roster-depends-admissions-epic.trycloudflare.com" />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+    />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300&family=Instrument+Serif:ital@0;1&display=swap"
+    />
+    <title>FlowOptionID — 0DTE Options Flow</title>
+    <script>
+      // Synchronously apply persisted theme before first paint to avoid
+      // a flash of unstyled tokens (var(--bg), var(--text-primary), etc.).
+      (function () {
+        try {
+          var stored = localStorage.getItem("foid-theme");
+          var theme = stored === "light" || stored === "dark" ? stored : "dark";
+          var root = document.documentElement;
+          root.setAttribute("data-theme", theme);
+          if (theme === "dark") root.classList.add("dark");
+          else root.classList.remove("dark");
+          root.style.colorScheme = theme;
+        } catch (e) {
+          /* fall back to default dark from class on <html> */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

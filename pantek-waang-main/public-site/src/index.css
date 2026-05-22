@@ -1,0 +1,352 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Light mode — clean and professional */
+    --background: 0 0% 98%;          /* #fafafa */
+    --foreground: 0 0% 4%;           /* #0a0a0a */
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 4%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 0 0% 4%;
+    --primary: 262 83% 58%;          /* violet-600 #7c3aed */
+    --primary-foreground: 0 0% 100%;
+    --secondary: 240 5% 96%;
+    --secondary-foreground: 240 6% 10%;
+    --muted: 240 5% 96%;
+    --muted-foreground: 240 4% 46%;
+    --accent: 192 91% 36%;           /* cyan-700 #0891b2 */
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 240 6% 90%;
+    --input: 240 6% 90%;
+    --ring: 262 83% 58%;
+    --radius: 0.625rem;
+
+    /* Data-viz semantic tokens — light */
+    --emerald: 158 64% 38%;          /* deeper for legibility on white */
+    --emerald-foreground: 0 0% 100%;
+    --rose: 350 78% 52%;
+    --rose-foreground: 0 0% 100%;
+    --amber: 38 92% 45%;
+    --amber-foreground: 0 0% 100%;
+    --violet: 258 83% 58%;
+    --violet-foreground: 0 0% 100%;
+  }
+
+  .dark {
+    /* Dark mode — SpotGamma-inspired deep blue-black base */
+    --background: 222 24% 6%;        /* #0b0d12 */
+    --foreground: 220 13% 92%;       /* #e7e9ee */
+    --card: 222 22% 9%;              /* #11141b */
+    --card-foreground: 220 13% 92%;
+    --popover: 222 24% 7%;
+    --popover-foreground: 220 13% 92%;
+    --primary: 254 95% 76%;          /* violet-400 #a78bfa */
+    --primary-foreground: 222 47% 11%;
+    --secondary: 220 12% 17%;
+    --secondary-foreground: 220 13% 92%;
+    --muted: 222 13% 20%;            /* #2b2f3a */
+    --muted-foreground: 220 8% 64%;
+    --accent: 187 85% 53%;           /* cyan-400 #22d3ee */
+    --accent-foreground: 222 47% 11%;
+    --destructive: 350 89% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 13% 17%;
+    --input: 220 13% 17%;
+    --ring: 254 95% 76%;
+
+    /* Data-viz semantic tokens — dark */
+    --emerald: 158 64% 52%;          /* #34d399 */
+    --emerald-foreground: 222 47% 11%;
+    --rose: 351 95% 71%;             /* #fb7185 */
+    --rose-foreground: 222 47% 11%;
+    --amber: 43 96% 56%;             /* #fbbf24 */
+    --amber-foreground: 222 47% 11%;
+    --violet: 252 95% 85%;           /* #c4b5fd */
+    --violet-foreground: 222 47% 11%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    color-scheme: light;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  html.dark {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans;
+    font-synthesis: none;
+    transition: background-color 250ms, color 250ms;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+
+  /* Tabular numerics for trading data */
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer utilities {
+  .grid-bg {
+    background-image:
+      linear-gradient(to right, hsl(var(--border) / 0.4) 1px, transparent 1px),
+      linear-gradient(to bottom, hsl(var(--border) / 0.4) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
+
+  .dot-grid {
+    background-image: radial-gradient(
+      hsl(var(--muted-foreground) / 0.18) 1px,
+      transparent 1px
+    );
+    background-size: 24px 24px;
+  }
+
+  .hero-gradient {
+    background:
+      radial-gradient(60% 60% at 50% 0%, hsl(var(--primary) / 0.18) 0%, transparent 70%),
+      radial-gradient(50% 50% at 80% 30%, hsl(var(--accent) / 0.12) 0%, transparent 70%),
+      radial-gradient(40% 40% at 10% 60%, hsl(var(--violet) / 0.1) 0%, transparent 70%);
+  }
+
+  /* Subtle gradient mesh used behind dashboard hero. Lower opacity in
+     light mode so it stays gentle on white. */
+  .mesh-bg {
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background:
+      radial-gradient(40rem 22rem at 18% -2%, hsl(var(--primary) / 0.08), transparent 70%),
+      radial-gradient(36rem 22rem at 86% 4%, hsl(var(--accent) / 0.07), transparent 70%);
+    filter: blur(60px);
+  }
+  .dark .mesh-bg {
+    background:
+      radial-gradient(40rem 22rem at 18% -2%, hsl(var(--primary) / 0.16), transparent 70%),
+      radial-gradient(36rem 22rem at 86% 4%, hsl(var(--accent) / 0.12), transparent 70%);
+    filter: blur(80px);
+  }
+
+  .text-gradient-flow {
+    background-image: linear-gradient(
+      120deg,
+      hsl(var(--primary)) 0%,
+      hsl(var(--violet)) 35%,
+      hsl(var(--accent)) 70%,
+      hsl(var(--primary)) 100%
+    );
+    background-size: 200% 200%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .glow-cta {
+    box-shadow: 0 0 0 rgba(0, 0, 0, 0);
+  }
+  .dark .glow-cta {
+    box-shadow: 0 0 60px rgba(167, 139, 250, 0.18);
+  }
+
+  .text-mono {
+    font-family: theme("fontFamily.mono");
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Custom scrollbar for dense tables */
+  .scrollbar-thin::-webkit-scrollbar {
+    height: 8px;
+    width: 8px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--border));
+    border-radius: 9999px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    background-color: hsl(var(--muted-foreground) / 0.5);
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────
+   FlowOptionID landing-page theme system (scoped via data-theme)
+   ─────────────────────────────────────────────────────────────── */
+:root[data-theme="dark"] {
+  --bg: #060810;
+  --bg-surface: rgba(10, 13, 24, 0.85);
+  --border-foid: rgba(99, 179, 237, 0.12);
+  --border-foid-strong: rgba(99, 179, 237, 0.28);
+  --text-primary: #E8F4FD;
+  --text-secondary: rgba(232, 244, 253, 0.55);
+  --text-muted: rgba(232, 244, 253, 0.3);
+  --accent-foid: #63B3ED;
+  --accent-put: #F687B3;
+  --accent-amber: #F6AD55;
+  --glow: rgba(99, 179, 237, 0.15);
+}
+:root[data-theme="light"] {
+  --bg: #F0F4F8;
+  --bg-surface: rgba(255, 255, 255, 0.75);
+  --border-foid: rgba(30, 64, 120, 0.12);
+  --border-foid-strong: rgba(30, 64, 120, 0.28);
+  --text-primary: #0D1B2E;
+  --text-secondary: rgba(13, 27, 46, 0.6);
+  --text-muted: rgba(13, 27, 46, 0.35);
+  --accent-foid: #1E4078;
+  --accent-put: #C53030;
+  --accent-amber: #C05621;
+  --glow: rgba(30, 64, 120, 0.1);
+}
+
+:root {
+  --font-display: 'Instrument Serif', serif;
+  --font-mono-foid: 'DM Mono', monospace;
+}
+
+/* The spec uses "var(--accent)" / "var(--border)" / "var(--font-mono)"
+   in the per-component instructions. Map them to the FOID landing
+   tokens via aliases activated only when data-theme is set. */
+:root[data-theme] {
+  --accent: var(--accent-foid);
+  --border-foid-alias: var(--border-foid);
+  --border-foid-strong-alias: var(--border-foid-strong);
+}
+
+/* When the landing page is mounted (data-theme present), font-family
+   on body switches to DM Mono. Otherwise the dashboard's existing fonts
+   stay intact. */
+:root[data-theme] body {
+  font-family: var(--font-mono-foid);
+  background: var(--bg);
+  color: var(--text-primary);
+}
+
+/* Liquid glass system (FOID landing) */
+.liquid-glass {
+  background: rgba(255, 255, 255, 0.01);
+  background-blend-mode: luminosity;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: none;
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.1);
+  position: relative;
+  overflow: hidden;
+}
+.liquid-glass::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1.4px;
+  background: linear-gradient(180deg,
+    rgba(255, 255, 255, 0.35) 0%,
+    rgba(255, 255, 255, 0.12) 20%,
+    rgba(255, 255, 255, 0) 40%,
+    rgba(255, 255, 255, 0) 60%,
+    rgba(255, 255, 255, 0.12) 80%,
+    rgba(255, 255, 255, 0.35) 100%);
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+          mask-composite: exclude;
+  pointer-events: none;
+}
+.liquid-glass-strong {
+  background: rgba(255, 255, 255, 0.01);
+  background-blend-mode: luminosity;
+  backdrop-filter: blur(40px);
+  -webkit-backdrop-filter: blur(40px);
+  border: none;
+  box-shadow: 4px 4px 8px rgba(0, 0, 0, 0.08), inset 0 1px 1px rgba(255, 255, 255, 0.15);
+  position: relative;
+  overflow: hidden;
+}
+.liquid-glass-strong::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1.4px;
+  background: linear-gradient(180deg,
+    rgba(255, 255, 255, 0.5) 0%,
+    rgba(255, 255, 255, 0.2) 20%,
+    rgba(255, 255, 255, 0) 40%,
+    rgba(255, 255, 255, 0) 60%,
+    rgba(255, 255, 255, 0.2) 80%,
+    rgba(255, 255, 255, 0.5) 100%);
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+          mask-composite: exclude;
+  pointer-events: none;
+}
+
+/* Animated CSS fallback when video assets are missing */
+.foid-bg-fallback {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(ellipse at 20% 30%, hsl(var(--primary) / 0.18), transparent 60%),
+    radial-gradient(ellipse at 80% 70%, hsl(var(--accent) / 0.15), transparent 60%),
+    radial-gradient(ellipse at 50% 90%, hsl(var(--violet) / 0.12), transparent 60%);
+  filter: blur(80px) saturate(1.2);
+  animation: foid-mesh-drift 24s ease-in-out infinite alternate;
+}
+
+/* Animations (FOID landing) */
+@keyframes foid-fade-rise {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes foid-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes foid-pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.8); }
+}
+@keyframes foid-ticker-scroll {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+@keyframes foid-mesh-drift {
+  0%   { transform: translate3d(0, 0, 0) scale(1); }
+  50%  { transform: translate3d(2%, -2%, 0) scale(1.08); }
+  100% { transform: translate3d(-2%, 2%, 0) scale(1); }
+}
+.animate-fade-rise    { animation: foid-fade-rise 0.7s ease-out both; }
+.animate-fade-rise-d1 { animation: foid-fade-rise 0.7s ease-out 0.15s both; }
+.animate-fade-rise-d2 { animation: foid-fade-rise 0.7s ease-out 0.30s both; }
+.animate-fade-rise-d3 { animation: foid-fade-rise 0.7s ease-out 0.45s both; }
+.animate-fade-rise-d4 { animation: foid-fade-rise 0.7s ease-out 0.60s both; }
+.animate-fade-in      { animation: foid-fade-in 1s ease-out both; }
+.animate-pulse-dot    { animation: foid-pulse-dot 1.8s ease-in-out infinite; }
+.animate-ticker       { animation: foid-ticker-scroll 35s linear infinite; }
