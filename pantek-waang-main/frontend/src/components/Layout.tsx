@@ -8,7 +8,6 @@ import {
   Server,
   ServerCog,
   Target,
-  UserCheck,
 } from "lucide-react";
 import { type ReactNode } from "react";
 import { NavLink, useNavigate } from "react-router-dom";
@@ -21,7 +20,6 @@ const NAV = [
   { to: "/live", label: "Live", icon: Radio },
   { to: "/data-inspector", label: "Data Inspector", icon: Database },
   { to: "/api-keys", label: "API Keys", icon: KeyRound },
-  { to: "/access-requests", label: "Access Requests", icon: UserCheck },
   { to: "/databento-keys", label: "Databento Keys", icon: Server },
   { to: "/system-status", label: "System Status", icon: ServerCog },
 ];

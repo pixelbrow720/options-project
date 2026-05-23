@@ -2,7 +2,6 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Layout } from "./components/Layout";
 import { useAuth } from "./lib/AuthContext";
-import { AccessRequestsPage } from "./pages/AccessRequests";
 import { ApiKeysPage } from "./pages/ApiKeys";
 import { DashboardPage } from "./pages/Dashboard";
 import { DataInspectorPage } from "./pages/DataInspector";
@@ -36,14 +35,6 @@ export function App() {
           element={
             <ProtectedRoute>
               <ApiKeysPage />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/access-requests"
-          element={
-            <ProtectedRoute>
-              <AccessRequestsPage />
             </ProtectedRoute>
           }
         />

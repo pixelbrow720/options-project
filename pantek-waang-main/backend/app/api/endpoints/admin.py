@@ -7,16 +7,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from sqlalchemy import desc, func, select, update
+from fastapi import APIRouter, Depends, HTTPException, Response, status
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import authenticate_admin, rate_limit
 from app.api.schemas import (
-    AccessApproveRequest,
-    AccessApproveResponse,
-    AccessRejectRequest,
-    AccessRequestSummary,
     AdminLoginRequest,
     AdminLoginResponse,
     ApiKeyCreate,
@@ -28,9 +24,7 @@ from app.api.schemas import (
     DatabentoKeyTestResult,
     DatabentoKeyUpdate,
     PipelineRunSummary,
-    PublicUserSummary,
     SystemStatus,
-    UserBanRequest,
 )
 from app.config import get_settings
 from app.core.crypto import decrypt_secret, encrypt_secret, mask_prefix
@@ -42,7 +36,6 @@ from app.core.security import (
     verify_password,
 )
 from app.db.models import (
-    AccessRequest,
     ApiKey,
     ComputedMetric,
     DatabentoApiKey,
@@ -51,8 +44,6 @@ from app.db.models import (
     FuturesTick,
     OptionsChain,
     PipelineRun,
-    User,
-    UserSession,
 )
 from app.db.session import get_db
 from app.ingestion.databento_live import get_live_ingester
@@ -461,261 +452,3 @@ async def test_databento_key(
             "Live verification is performed by the ingester on the next connect."
         ),
     )
-
-
-# ── Rev 5: public users + access-request workflow ───────────────────────────
-
-
-async def _user_summary(user: User, session: AsyncSession) -> PublicUserSummary:
-    api_key: ApiKey | None = None
-    if user.api_key_id is not None:
-        api_key = await session.get(ApiKey, user.api_key_id)
-    return PublicUserSummary(
-        id=user.id,
-        discord_id=user.discord_id,
-        discord_username=user.discord_username,
-        discord_avatar=user.discord_avatar,
-        email=user.email,
-        status=user.status,
-        guild_verified=bool(user.guild_verified),
-        has_api_key=api_key is not None,
-        api_key_label=api_key.label if api_key else None,
-        api_key_prefix=api_key.key_prefix if api_key else None,
-        allowed_symbols=list(api_key.allowed_symbols or []) if api_key else [],
-        created_at=user.created_at,
-        last_login_at=user.last_login_at,
-    )
-
-
-@router.get("/access-requests", response_model=list[AccessRequestSummary])
-async def list_access_requests(
-    _admin: Annotated[str, Depends(authenticate_admin)],
-    session: AsyncSession = Depends(get_db),
-    pending_only: bool = True,
-) -> list[AccessRequestSummary]:
-    """List access requests, optionally filtering to pending users only."""
-    q = select(AccessRequest).order_by(desc(AccessRequest.requested_at))
-    rows = (await session.execute(q)).scalars().all()
-
-    summaries: list[AccessRequestSummary] = []
-    for req in rows:
-        user = await session.get(User, req.user_id)
-        if user is None:
-            continue
-        if pending_only and user.status != "pending":
-            continue
-        summaries.append(
-            AccessRequestSummary(
-                user=await _user_summary(user, session),
-                requested_at=req.requested_at,
-                approved_at=req.approved_at,
-                approved_by=req.approved_by,
-                rejected_at=req.rejected_at,
-                rejected_by=req.rejected_by,
-                rejection_reason=req.rejection_reason,
-                api_key_id=req.api_key_id,
-            )
-        )
-    return summaries
-
-
-@router.post(
-    "/access-requests/{user_id}/approve",
-    response_model=AccessApproveResponse,
-    dependencies=[Depends(rate_limit(60, 60, key="access_request_mutate"))],
-)
-async def approve_access_request(
-    request: Request,
-    user_id: int,
-    payload: AccessApproveRequest,
-    admin_user: Annotated[str, Depends(authenticate_admin)],
-    session: AsyncSession = Depends(get_db),
-) -> AccessApproveResponse:
-    """Approve a pending user.
-
-    If ``api_key_id`` is supplied, that existing key is bridged to the
-    user. Otherwise a fresh key is generated, labelled
-    ``Public-{discord_username}``, with the requested or default
-    ``allowed_symbols``. The plaintext key is returned exactly once.
-    """
-    user = await session.get(User, user_id)
-    if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-    if user.status == "banned":
-        raise HTTPException(
-            status_code=409, detail="Cannot approve a banned user"
-        )
-
-    plaintext_returned: str | None = None
-    api_key: ApiKey | None = None
-
-    if payload.api_key_id is not None:
-        api_key = await session.get(ApiKey, payload.api_key_id)
-        if api_key is None:
-            raise HTTPException(
-                status_code=404, detail="Provided api_key_id not found"
-            )
-    else:
-        symbols = (
-            payload.allowed_symbols
-            if payload.allowed_symbols is not None
-            else ["SPXW", "NDXP"]
-        )
-        plaintext = generate_api_key()
-        api_key = ApiKey(
-            key_hash=hash_api_key(plaintext),
-            key_prefix=display_prefix(plaintext),
-            label=f"Public-{user.discord_username}",
-            allowed_symbols=symbols,
-            is_active=True,
-            usage_count=0,
-        )
-        session.add(api_key)
-        await session.flush()
-        plaintext_returned = plaintext
-
-    user.api_key_id = api_key.id
-    user.status = "approved"
-
-    # Update the most recent ``access_requests`` row for this user.
-    latest_req = (
-        await session.execute(
-            select(AccessRequest)
-            .where(AccessRequest.user_id == user_id)
-            .order_by(desc(AccessRequest.requested_at))
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    if latest_req is not None:
-        latest_req.approved_at = datetime.now(UTC)
-        latest_req.approved_by = admin_user
-        latest_req.api_key_id = api_key.id
-        latest_req.rejected_at = None
-        latest_req.rejected_by = None
-        latest_req.rejection_reason = None
-
-    await session.commit()
-    await session.refresh(user)
-    await session.refresh(api_key)
-
-    summary = ApiKeySummary(
-        id=api_key.id,
-        key_prefix=api_key.key_prefix,
-        label=api_key.label,
-        allowed_symbols=list(api_key.allowed_symbols or []),
-        created_at=api_key.created_at,
-        expires_at=api_key.expires_at,
-        is_active=api_key.is_active,
-        last_used_at=api_key.last_used_at,
-        usage_count=api_key.usage_count or 0,
-    )
-    return AccessApproveResponse(
-        user=await _user_summary(user, session),
-        api_key=summary,
-        plaintext_key=plaintext_returned,
-    )
-
-
-@router.post(
-    "/access-requests/{user_id}/reject",
-    response_model=PublicUserSummary,
-    dependencies=[Depends(rate_limit(60, 60, key="access_request_mutate"))],
-)
-async def reject_access_request(
-    request: Request,
-    user_id: int,
-    payload: AccessRejectRequest,
-    admin_user: Annotated[str, Depends(authenticate_admin)],
-    session: AsyncSession = Depends(get_db),
-) -> PublicUserSummary:
-    user = await session.get(User, user_id)
-    if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    user.status = "rejected"
-
-    latest_req = (
-        await session.execute(
-            select(AccessRequest)
-            .where(AccessRequest.user_id == user_id)
-            .order_by(desc(AccessRequest.requested_at))
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    if latest_req is not None:
-        latest_req.rejected_at = datetime.now(UTC)
-        latest_req.rejected_by = admin_user
-        latest_req.rejection_reason = payload.reason
-
-    # Revoke any active sessions so the rejection takes effect immediately.
-    await session.execute(
-        update(UserSession)
-        .where(UserSession.user_id == user_id, UserSession.revoked.is_(False))
-        .values(revoked=True)
-    )
-
-    await session.commit()
-    await session.refresh(user)
-    return await _user_summary(user, session)
-
-
-@router.post("/users/{user_id}/ban", response_model=PublicUserSummary)
-async def ban_user(
-    user_id: int,
-    payload: UserBanRequest,
-    _admin: Annotated[str, Depends(authenticate_admin)],
-    session: AsyncSession = Depends(get_db),
-) -> PublicUserSummary:
-    user = await session.get(User, user_id)
-    if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-    user.status = "banned"
-    user.notes = (
-        f"{(user.notes or '').rstrip()}\nBanned: {payload.reason}".strip()
-    )
-    # Also disable the bridged API key so machine clients can't keep
-    # using it after the ban.
-    if user.api_key_id is not None:
-        api_key = await session.get(ApiKey, user.api_key_id)
-        if api_key is not None:
-            api_key.is_active = False
-
-    await session.execute(
-        update(UserSession)
-        .where(UserSession.user_id == user_id, UserSession.revoked.is_(False))
-        .values(revoked=True)
-    )
-    await session.commit()
-    await session.refresh(user)
-    return await _user_summary(user, session)
-
-
-@router.post("/users/{user_id}/revoke-sessions", status_code=204, response_class=Response)
-async def revoke_user_sessions(
-    user_id: int,
-    _admin: Annotated[str, Depends(authenticate_admin)],
-    session: AsyncSession = Depends(get_db),
-) -> Response:
-    user = await session.get(User, user_id)
-    if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-    await session.execute(
-        update(UserSession)
-        .where(UserSession.user_id == user_id, UserSession.revoked.is_(False))
-        .values(revoked=True)
-    )
-    await session.commit()
-    return Response(status_code=204)
-
-
-@router.get("/users", response_model=list[PublicUserSummary])
-async def list_users(
-    _admin: Annotated[str, Depends(authenticate_admin)],
-    session: AsyncSession = Depends(get_db),
-    status_filter: str | None = None,
-) -> list[PublicUserSummary]:
-    q = select(User).order_by(desc(User.created_at))
-    if status_filter:
-        q = q.where(User.status == status_filter)
-    rows = (await session.execute(q)).scalars().all()
-    return [await _user_summary(r, session) for r in rows]

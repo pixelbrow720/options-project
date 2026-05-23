@@ -129,6 +129,18 @@ def reset_basis_cache(symbol: str | None = None) -> None:
         _last_spot_cache.pop(symbol.upper(), None)
 
 
+def get_basis(symbol: str) -> float | None:
+    """Public accessor for the cached EMA basis for ``symbol``.
+
+    Returns the smoothed cash-minus-futures basis (or ``None`` if no entry
+    has been recorded yet). Cross-process consumers — most notably
+    :mod:`app.ingestion.databento_globex` — should prefer this over
+    reaching into ``_basis_cache`` directly.
+    """
+    entry = _basis_cache.get(symbol.upper())
+    return entry.value if entry is not None else None
+
+
 def _update_basis_ema(symbol: str, new_basis: float) -> _BasisEntry:
     """Update the per-symbol basis EMA and return the new entry."""
     settings = get_settings()
@@ -321,8 +333,6 @@ def get_front_month_contract(
         return None
 
     today_d = (today or pd.Timestamp.utcnow().tz_localize(None)).date()
-    if hasattr(today_d, "date"):
-        today_d = today_d.date()
 
     contracts = futures_df["contract_symbol"].dropna().astype(str).unique().tolist()
     candidates: list[tuple[str, pd.Timestamp]] = []

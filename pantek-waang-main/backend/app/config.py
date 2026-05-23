@@ -33,8 +33,8 @@ class Settings(BaseSettings):
     # conservative for a single-pod prod deployment under moderate load
     # (~ a few req/s sustained, occasional bursts). Operators running a
     # larger fleet should raise these via env vars.
-    db_pool_size: int = Field(default=20, alias="DB_POOL_SIZE")
-    db_max_overflow: int = Field(default=10, alias="DB_MAX_OVERFLOW")
+    db_pool_size: int = Field(default=5, alias="DB_POOL_SIZE")
+    db_max_overflow: int = Field(default=5, alias="DB_MAX_OVERFLOW")
     db_pool_recycle_seconds: int = Field(default=3600, alias="DB_POOL_RECYCLE_SECONDS")
     db_pool_pre_ping: bool = Field(default=True, alias="DB_POOL_PRE_PING")
 
@@ -155,44 +155,14 @@ class Settings(BaseSettings):
     that strips client-supplied ``X-Forwarded-For`` headers — otherwise
     a client can spoof their IP and bypass per-IP rate limits."""
 
-    # ── Rev 5: public site / Discord OAuth ────────────────────────────────
-    discord_client_id: str = Field(default="", alias="DISCORD_CLIENT_ID")
-    discord_client_secret: str = Field(default="", alias="DISCORD_CLIENT_SECRET")
-    discord_bot_token: str = Field(default="", alias="DISCORD_BOT_TOKEN")
-    discord_guild_id: str = Field(default="", alias="DISCORD_GUILD_ID")
-    discord_redirect_uri: str = Field(
-        default="http://localhost:3001/auth/callback",
-        alias="DISCORD_REDIRECT_URI",
-    )
-    discord_invite_url: str = Field(
-        default="https://discord.gg/dy78P5vP62", alias="DISCORD_INVITE_URL"
-    )
-    discord_contact_handles: str = Field(
-        default="@nods911_,@arveloon,@iqbal4o4",
-        alias="DISCORD_CONTACT_HANDLES",
-    )
-    public_session_jwt_secret: str = Field(
-        default="", alias="PUBLIC_SESSION_JWT_SECRET"
-    )
-    """Optional dedicated secret for public-session JWTs. Falls back to
-    ``JWT_SECRET`` when empty so a single deployment can run unchanged."""
-    public_session_expire_hours: int = Field(
-        default=24 * 7, alias="PUBLIC_SESSION_EXPIRE_HOURS"
-    )
-    public_cors_origins: str = Field(
-        default="http://localhost:3001", alias="PUBLIC_CORS_ORIGINS"
-    )
-    """Comma-separated list of allowed origins for the public site."""
-
     admin_cors_origins: str = Field(
         default="http://localhost:3000", alias="ADMIN_CORS_ORIGINS"
     )
     """Comma-separated list of allowed origins for the admin dashboard.
 
-    Combined with ``public_cors_origins`` to form the actual
-    ``Access-Control-Allow-Origin`` allowlist. Set to a wildcard (``*``)
-    only for local dev — production deployments should pin both lists
-    to the exact origins that should be able to call the API.
+    Set to a wildcard (``*``) only for local dev — production deployments
+    should pin this to the exact origins that should be able to call
+    the API.
     """
 
     enable_openapi_docs: bool = Field(
@@ -229,55 +199,11 @@ class Settings(BaseSettings):
         return self.databento_api_key_globex or self.databento_api_key
 
     @property
-    def public_session_secret(self) -> str:
-        """Secret used to sign public-session JWTs.
-
-        Falls back to ``jwt_secret`` so existing single-secret deployments
-        keep working. Operators who want a dedicated secret for the public
-        site (so admin tokens and user tokens can be rotated independently)
-        can set ``PUBLIC_SESSION_JWT_SECRET``.
-        """
-        return self.public_session_jwt_secret or self.jwt_secret
-
-    @property
-    def public_cors_origin_list(self) -> list[str]:
-        return [
-            o.strip()
-            for o in (self.public_cors_origins or "").split(",")
-            if o.strip()
-        ]
-
-    @property
     def admin_cors_origin_list(self) -> list[str]:
         return [
             o.strip()
             for o in (self.admin_cors_origins or "").split(",")
             if o.strip()
-        ]
-
-    @property
-    def cors_origin_list(self) -> list[str]:
-        """Combined CORS allowlist for public + admin origins.
-
-        Deduplicated, preserves order. ``["*"]`` is honoured (any list
-        containing ``*`` collapses to wildcard) so local dev keeps
-        working with the bundled defaults — production deployments
-        should not include ``*`` here.
-        """
-        merged: list[str] = []
-        for origin in (*self.public_cors_origin_list, *self.admin_cors_origin_list):
-            if origin == "*":
-                return ["*"]
-            if origin and origin not in merged:
-                merged.append(origin)
-        return merged
-
-    @property
-    def discord_contact_handle_list(self) -> list[str]:
-        return [
-            h.strip()
-            for h in (self.discord_contact_handles or "").split(",")
-            if h.strip()
         ]
 
 

@@ -219,7 +219,7 @@ def upgrade() -> None:
                     f"timescaledb.compress_orderby = 'ts DESC');"
                 )
             # add_compression_policy supports if_not_exists since TimescaleDB 2.6.
-            safe_execute_tsdb("SELECT add_compression_policy('{table}', INTERVAL '1 day', if_not_exists => TRUE)")
+            safe_execute_tsdb(f"SELECT add_compression_policy('{table}', INTERVAL '1 day', if_not_exists => TRUE)")
 
         # Tighter chunk interval on options_chain (default is 7 days, but
         # our chain is high-cardinality so smaller chunks compress better

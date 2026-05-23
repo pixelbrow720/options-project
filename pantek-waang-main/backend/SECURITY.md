@@ -10,11 +10,9 @@ deployment that accepts traffic from the internet.
 | Var                          | Why                                                        |
 | ---------------------------- | ---------------------------------------------------------- |
 | `ADMIN_PASSWORD`             | Default is `changeme`. Brute-force target.                 |
-| `JWT_SECRET`                  | Signs admin JWTs and (when blank) public-session JWTs.    |
-| `PUBLIC_SESSION_JWT_SECRET`  | Signs public-site JWTs. Set to a *different* random value. |
+| `JWT_SECRET`                 | Signs admin JWTs.                                          |
 
-The application logs `WARNING_DEFAULT_ADMIN_PASSWORD` /
-`WARNING_DEFAULT_JWT_SECRET` on startup whenever any of the above is
+The application refuses to boot in non-test mode whenever either is
 unset or matches a known dev default.
 
 ### Generating strong secrets
@@ -23,29 +21,14 @@ unset or matches a known dev default.
 python -c "import secrets; print(secrets.token_urlsafe(64))"
 ```
 
-Run once per secret — never reuse the same value across `JWT_SECRET`
-and `PUBLIC_SESSION_JWT_SECRET`.
-
 ## Rate limits
 
 Enforced via `slowapi` decorators on individual routes:
 
 * `POST /admin/login` — `5/minute` per IP (brute-force protection)
-* `GET  /public/auth/discord/start` — `30/minute` per IP
-* `POST /public/auth/login` — `30/minute` per IP
-* `POST /admin/access-requests/{id}/approve|reject` — `60/minute` per IP
 * `GET  /v1/{symbol}/*` — `RATE_LIMIT_PER_MINUTE` (default 120) per API key
 
 429 responses include a `detail` field with the limit that fired.
-
-## Cache TTLs
-
-`/public/{symbol}/snapshot|0dte|spot|futures-levels|last-close` set
-`Cache-Control: public, max-age=15, stale-while-revalidate=30`. The
-pipeline refreshes every 60s, so a 15s edge cache is always fresh and
-absorbs request bursts.
-
-`/public/me`, `/public/auth/*`, and `/health` set `Cache-Control: no-store`.
 
 ## Compression
 
@@ -70,9 +53,3 @@ after the change.
 Snapshot the `db_data` Docker volume nightly (`pg_dump -Fc`). The
 `pipeline_runs` + `flow_events` tables are append-only and grow ~50 MB/day
 under default load — provision accordingly.
-
-## Discord bot
-
-Required intents: `Server Members Intent` (for guild membership probes).
-Required permissions: none beyond default — the bot only calls
-`GET /guilds/{guild_id}/members/{user_id}`. Invite scope: `bot`.

@@ -42,6 +42,12 @@ from app.config import get_settings
 from app.core.logging import get_logger
 from app.db.models import EodOpenInterest
 from app.db.session import get_session_factory
+from app.ingestion.key_pool import (
+    KeyCandidate,
+    iter_keys,
+    record_key_error,
+    record_key_success,
+)
 
 try:
     from app.processing.session import _now_eastern as _eastern_now
@@ -235,23 +241,97 @@ async def fetch_eod_oi_from_databento(
     underlying: str, *, lookback_days: int = 7
 ) -> list[dict]:
     """Fetch the latest EOD OI rows for ``underlying``. Returns possibly empty list."""
-    settings = get_settings()
-    if not settings.opra_api_key:
-        logger.warning("eod_oi_skipped_no_api_key", symbol=underlying)
-        return []
-
     try:
         import databento as db
     except ImportError:
         logger.warning("databento_import_failed_for_eod_oi")
         return []
 
+    factory = get_session_factory()
+    try:
+        async with factory() as session:
+            candidates = await iter_keys(session, DATASET)
+    except Exception:  # noqa: BLE001 — degrade gracefully on DB failure
+        logger.exception("eod_oi_key_pool_resolve_failed")
+        candidates = []
+    if not candidates:
+        logger.warning("eod_oi_skipped_no_api_key", symbol=underlying)
+        return []
+
     end = datetime.now(UTC) - timedelta(minutes=30)
     start = end - timedelta(days=lookback_days)
-
     parent = _parent_symbol(underlying)
-    client = db.Historical(key=settings.opra_api_key)
 
+    last_error: str | None = None
+    for candidate in candidates:
+        try:
+            client = db.Historical(key=candidate.api_key)
+            rows = await _fetch_with_client(
+                client,
+                underlying=underlying,
+                parent=parent,
+                start=start,
+                end=end,
+                lookback_days=lookback_days,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+            logger.warning(
+                "eod_oi_candidate_failed",
+                symbol=underlying,
+                key_label=candidate.label,
+                error=last_error[:200],
+            )
+            await _record_candidate_error(candidate, last_error)
+            continue
+
+        # Treat *any* successful round-trip (even an empty result) as a key
+        # health signal. The empty-result path is logged separately by the
+        # inner helper.
+        await _record_candidate_success(candidate)
+        return rows
+
+    if last_error is not None:
+        logger.warning(
+            "eod_oi_all_candidates_failed",
+            symbol=underlying,
+            error=last_error[:200],
+        )
+    return []
+
+
+async def _record_candidate_success(candidate: KeyCandidate) -> None:
+    if candidate.source != "db":
+        return
+    try:
+        factory = get_session_factory()
+        async with factory() as session:
+            await record_key_success(session, candidate)
+    except Exception:  # noqa: BLE001
+        logger.exception("eod_oi_record_key_success_failed", key_label=candidate.label)
+
+
+async def _record_candidate_error(candidate: KeyCandidate, error_msg: str) -> None:
+    if candidate.source != "db":
+        return
+    try:
+        factory = get_session_factory()
+        async with factory() as session:
+            await record_key_error(session, candidate, error_msg=error_msg)
+    except Exception:  # noqa: BLE001
+        logger.exception("eod_oi_record_key_error_failed", key_label=candidate.label)
+
+
+async def _fetch_with_client(
+    client,
+    *,
+    underlying: str,
+    parent: str,
+    start: datetime,
+    end: datetime,
+    lookback_days: int,
+) -> list[dict]:
+    """Run the three-strategy fetch against an already-keyed client."""
     # ── Strategy 1: statistics via parent symbology ──────────────────────
     df = await _fetch_statistics(
         client, parent=parent, start=start, end=end, stype_in="parent"

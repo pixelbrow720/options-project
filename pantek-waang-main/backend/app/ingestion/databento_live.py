@@ -181,6 +181,7 @@ class DatabentoLiveIngester:
         # Counters surfaced via diagnostics for operator visibility.
         self._dropped_no_ts_count: int = 0
         self._unmatched_total: int = 0
+        self._unmatched_count: int = 0
         self._last_unmatched_bootstrap_at: datetime | None = None
         # Most recent KeyCandidate label that successfully connected — surfaced
         # in diagnostics so operators can tell which key the live stream is on.
@@ -700,7 +701,7 @@ class DatabentoLiveIngester:
             # Keep the legacy "first 5" log so a fresh deployment still surfaces
             # a sample in plain logs; everything after that goes to the periodic
             # rollup at the 100-multiple boundary.
-            self._unmatched_count = getattr(self, "_unmatched_count", 0) + 1
+            self._unmatched_count = self._unmatched_count + 1
             if self._unmatched_count <= 5:
                 logger.info(
                     "live_trade_unmatched_instrument",
@@ -894,6 +895,11 @@ class DatabentoLiveIngester:
             state["ask"] = ask
         if last_price is not None:
             state["last_price"] = last_price
+        # Mirror the cmbp path: stamp the quote with the record's ts so the
+        # trade path can drop stale NBBO before computing side / signed_premium.
+        if bid is not None or ask is not None:
+            ts = self._record_ts(record)
+            state["quote_ts"] = ts if ts is not None else datetime.now(UTC)
 
         await self._emit_row(instrument_id, record)
 

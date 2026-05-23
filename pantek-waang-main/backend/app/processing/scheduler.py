@@ -204,11 +204,13 @@ def start_scheduler() -> AsyncIOScheduler:
     close_hh, close_mm = _parse_hhmm(settings.rth_close_time, (16, 15))
     # Fire 1 minute before open / 1 minute after close. The hour offsets
     # wrap around midnight — e.g. RTH_OPEN_TIME=00:00 produces the
-    # pre-open hook at 23:59 the day before. A midnight session is exotic
-    # (the scheduler still applies day_of_week='mon-fri', so the hook
-    # fires on Friday-night → Saturday-morning configurations and may
-    # need recalibration); the wrap simply prevents an APScheduler
-    # CronTrigger validation crash on edge configs.
+    # pre-open hook at 23:59 the day before. The day_of_week filter is
+    # NOT adjusted for that wraparound: a midnight RTH config is
+    # explicitly unsupported and would fire the pre-open hook on the
+    # *previous* day's date while still gated by mon-fri, so a Monday
+    # 00:00 open would have its pre-open hook on Sunday and never fire.
+    # The modulo prevents an APScheduler CronTrigger validation crash
+    # on edge configs but does not pretend to make them correct.
     pre_open_mm = (open_mm - 1) % 60
     pre_open_hh = (open_hh - (1 if open_mm == 0 else 0)) % 24
     post_close_mm = (close_mm + 1) % 60

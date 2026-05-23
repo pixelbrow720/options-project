@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import os
 import threading
-import uuid
 from collections import defaultdict, deque
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from time import monotonic
 from typing import Annotated
@@ -20,12 +20,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.security import (
-    PUBLIC_SESSION_TOKEN_TYPE,
     decode_jwt_token,
-    decode_public_session_token,
     verify_api_key,
 )
-from app.db.models import ApiKey, User, UserSession
+from app.db.models import ApiKey
 from app.db.session import get_db
 
 # ── Rate limiter ─────────────────────────────────────────────────────────────
@@ -114,7 +112,9 @@ class _SlidingWindowLimiter:
 _simple_limiter = _SlidingWindowLimiter()
 
 
-def rate_limit(limit: int, period_seconds: int = 60, *, key: str = "") -> callable:
+def rate_limit(
+    limit: int, period_seconds: int = 60, *, key: str = ""
+) -> Callable[..., Awaitable[None]]:
     """Build a FastAPI dependency that enforces a per-IP rate limit.
 
     Usage::
@@ -253,153 +253,3 @@ async def authenticate_admin(
             status_code=status.HTTP_403_FORBIDDEN, detail="Not an admin user"
         )
     return sub
-
-
-# ── Public-user session auth (Rev 5) ─────────────────────────────────────────
-
-
-async def authenticate_user_session(
-    creds: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
-    session: AsyncSession = Depends(get_db),
-) -> User:
-    """Validate a public-session JWT and return the underlying ``User`` row.
-
-    Rejects:
-      * missing / malformed bearer token  → 401
-      * expired or signature-mismatched   → 401
-      * wrong token ``typ``               → 401
-      * revoked or expired ``user_sessions`` row → 401
-      * ``users`` row in non-``approved`` state  → 403
-
-    Returns the authenticated :class:`User` ORM row. The route can read
-    ``user.api_key_id`` to look up the bridged ``ApiKey`` for symbol
-    authorisation.
-    """
-    if creds is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing bearer token",
-        )
-    try:
-        payload = decode_public_session_token(creds.credentials)
-    except jwt.ExpiredSignatureError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Session expired"
-        ) from exc
-    except jwt.InvalidTokenError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session token"
-        ) from exc
-
-    if payload.get("typ") != PUBLIC_SESSION_TOKEN_TYPE:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid session token type",
-        )
-
-    sid = payload.get("sid")
-    sub = payload.get("sub")
-    if not sid or not sub:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Malformed session token",
-        )
-
-    try:
-        session_uuid = uuid.UUID(str(sid))
-    except (ValueError, TypeError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Malformed session id",
-        ) from exc
-
-    user_session = await session.get(UserSession, session_uuid)
-    if user_session is None or user_session.revoked:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Session revoked"
-        )
-    expires_at = user_session.expires_at
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=UTC)
-    if expires_at < datetime.now(UTC):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Session expired"
-        )
-
-    try:
-        user_id = int(sub)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Malformed session subject",
-        ) from exc
-
-    user = await session.get(User, user_id)
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found"
-        )
-    if user.status == "banned":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="Account banned"
-        )
-    if user.status != "approved":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Account is {user.status}",
-        )
-
-    return user
-
-
-async def resolve_user_api_key(
-    user: User, session: AsyncSession
-) -> ApiKey:
-    """Return the ``ApiKey`` row bridged to ``user``. Raises 403 if missing."""
-    if user.api_key_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="No API key assigned",
-        )
-    api_key = await session.get(ApiKey, user.api_key_id)
-    if api_key is None or not api_key.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Bridged API key inactive",
-        )
-    if api_key.expires_at is not None:
-        expires_at = api_key.expires_at
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=UTC)
-        if expires_at < datetime.now(UTC):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Bridged API key expired",
-            )
-    return api_key
-
-
-def require_user_symbol_access(symbol_param: str = "symbol"):
-    """Factory: authorise a public-session user against the path symbol.
-
-    The check uses the ``allowed_symbols`` of the bridged ``ApiKey``, so
-    operators only configure ACLs in one place (per-user-key).
-    """
-
-    async def _dep(
-        request: Request,
-        user: Annotated[User, Depends(authenticate_user_session)],
-        session: AsyncSession = Depends(get_db),
-    ) -> tuple[User, ApiKey]:
-        api_key = await resolve_user_api_key(user, session)
-        symbol = request.path_params.get(symbol_param)
-        if symbol is not None:
-            symbol_u = symbol.upper()
-            if symbol_u not in [s.upper() for s in (api_key.allowed_symbols or [])]:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"User not authorized for symbol {symbol_u}",
-                )
-        return user, api_key
-
-    return _dep

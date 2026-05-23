@@ -21,11 +21,8 @@ from app.api.endpoints import (
     health,
     hiro,
     inspector,
-    public_auth,
-    public_data,
     snapshot,
     stream,
-    stream_ticket,
 )
 from app.config import get_settings
 from app.core.logging import configure_logging, get_logger
@@ -75,19 +72,35 @@ async def lifespan(app: FastAPI):
             raise RuntimeError(
                 "JWT_SECRET is unset or default; refusing to start in production mode"
             )
-        if (
-            settings.public_session_jwt_secret
-            and is_default_jwt_secret(settings.public_session_jwt_secret)
-        ):
-            logger.warning(
-                "WARNING_DEFAULT_PUBLIC_SESSION_JWT_SECRET",
-                detail=(
-                    "PUBLIC_SESSION_JWT_SECRET matches a known default. "
-                    "Rotate it before exposing the public site."
-                ),
-            )
 
     logger.info("startup", supported_symbols=settings.supported_symbols)
+
+    # ── Pipeline-runs orphan sweep ───────────────────────────────────────
+    # A hard crash can leave ``pipeline_runs.status='running'`` rows behind.
+    # Mark anything that's been "running" for more than 15 minutes as
+    # ``aborted`` so the completeness checker doesn't treat a dead worker
+    # as a still-in-flight one. Best-effort: we never block startup on it.
+    try:
+        from sqlalchemy import text
+
+        from app.db.session import get_session_factory
+
+        factory = get_session_factory()
+        async with factory() as s:
+            res = await s.execute(
+                text(
+                    "UPDATE pipeline_runs SET status='aborted', "
+                    "error='process restarted while running' "
+                    "WHERE status='running' AND started_at < NOW() - INTERVAL '15 minutes'"
+                )
+            )
+            await s.commit()
+            logger.info(
+                "pipeline_runs_orphan_sweep",
+                rows=getattr(res, "rowcount", None),
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("pipeline_runs_orphan_sweep_failed")
 
     background_tasks: list[asyncio.Task] = []
     scheduler = None
@@ -388,15 +401,24 @@ def create_app() -> FastAPI:
     # ASGITransport + anyio task groups. The @limiter.limit decorators on
     # individual routes still enforce limits; the middleware only adds extra
     # response headers we don't depend on.
-    cors_origins = settings.cors_origin_list or ["*"]
+    cors_origins = settings.admin_cors_origin_list or ["http://localhost:3000"]
     use_wildcard = "*" in cors_origins
+    if not settings.admin_cors_origin_list and not _testing_mode():
+        # Empty ``ADMIN_CORS_ORIGINS`` used to silently fall back to ``["*"]``,
+        # which is unsafe with credentialed endpoints. Refuse the wildcard
+        # default and pin to a sane localhost for dev.
+        logger.warning(
+            "admin_cors_origins_unset_using_localhost_default",
+            default=cors_origins,
+            hint="set ADMIN_CORS_ORIGINS to explicit origins in production",
+        )
     app.add_middleware(
         CORSMiddleware,
-        # Wildcard is honoured for local dev (the default config keeps
-        # the existing behaviour), but production deployments should
-        # set ``PUBLIC_CORS_ORIGINS`` / ``ADMIN_CORS_ORIGINS`` to
-        # explicit origins. ``allow_credentials`` MUST be False whenever
-        # the origin list is wildcard — browsers refuse the combination.
+        # Production deployments should set ``ADMIN_CORS_ORIGINS`` to
+        # explicit origins. When the env var is empty we default to a
+        # localhost dev origin rather than wildcard. ``allow_credentials``
+        # MUST be False whenever the origin list contains ``*`` because
+        # browsers refuse the combination.
         allow_origins=cors_origins,
         allow_credentials=not use_wildcard,
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
@@ -415,8 +437,8 @@ def create_app() -> FastAPI:
 
     # Lightweight security-headers middleware. Pure ASGI (not
     # BaseHTTPMiddleware) so it stays compatible with httpx + anyio task
-    # groups under tests. Defense-in-depth: even though the public site
-    # also injects these via Vercel for its own surface, the API itself
+    # groups under tests. Defense-in-depth: even though the admin frontend
+    # also injects these via its host for its own surface, the API itself
     # serves error pages and OpenAPI docs that benefit from the same
     # baseline guarantees.
     app.add_middleware(_SecurityHeadersMiddleware)
@@ -428,15 +450,11 @@ def create_app() -> FastAPI:
     # ``data.py``. Route order matters: Starlette matches in declaration order.
     app.include_router(snapshot.router)
     app.include_router(stream.router)
-    app.include_router(stream_ticket.router)
     app.include_router(flow.router)
     app.include_router(hiro.router)
     app.include_router(data.router)
     app.include_router(admin.router)
     app.include_router(inspector.router)
-    # Rev 5 — public-site surface (Discord OAuth + session-JWT data routes).
-    app.include_router(public_auth.router)
-    app.include_router(public_data.router)
     return app
 
 

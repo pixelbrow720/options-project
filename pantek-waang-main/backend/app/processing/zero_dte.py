@@ -271,7 +271,7 @@ def compute_zero_dte_summary(
         zero, weight_col="volume", risk_free_rate=risk_free_rate
     )
     charm_summary = compute_charm(
-        zero, weight_col="oi", risk_free_rate=risk_free_rate
+        zero, weight_col="oi", risk_free_rate=risk_free_rate, tau_years=tau
     )
     charm_decay = compute_charm_decay_rate(
         zero,

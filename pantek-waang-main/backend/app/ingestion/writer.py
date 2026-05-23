@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.dialects.postgresql import insert
@@ -55,7 +55,7 @@ class OptionsChainWriter:
         # flush is mid-roundtrip, without two flushes racing each other.
         self._flush_lock = asyncio.Lock()
         self._flushing: bool = False
-        self._last_flush_ts = datetime.utcnow()
+        self._last_flush_ts = datetime.now(UTC)
         self._last_event_ts: datetime | None = None
         self._row_counts: dict[str, int] = {}
         self._shed_rows = 0
@@ -86,7 +86,7 @@ class OptionsChainWriter:
             else:
                 shed = False
                 self._buffer.append(row)
-                self._last_event_ts = row.get("ts") or datetime.utcnow()
+                self._last_event_ts = row.get("ts") or datetime.now(UTC)
                 symbol = row.get("symbol")
                 if symbol:
                     self._row_counts[symbol] = self._row_counts.get(symbol, 0) + 1
@@ -124,7 +124,7 @@ class OptionsChainWriter:
                         return 0
                     batch = self._buffer
                     self._buffer = []
-                    self._last_flush_ts = datetime.utcnow()
+                    self._last_flush_ts = datetime.now(UTC)
 
                 # Deduplicate by primary-key tuple. Live trades on the same contract
                 # frequently share a microsecond timestamp, which would cause Postgres

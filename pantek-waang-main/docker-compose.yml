@@ -47,18 +47,5 @@ services:
     ports:
       - "3000:80"
 
-  public-site:
-    build:
-      context: ./public-site
-      dockerfile: Dockerfile
-      args:
-        VITE_API_BASE_URL: ${VITE_PUBLIC_API_BASE_URL:-http://localhost:8000}
-    container_name: flowoptionid-public
-    restart: unless-stopped
-    depends_on:
-      - backend
-    ports:
-      - "3001:80"
-
 volumes:
   db_data:

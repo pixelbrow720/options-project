@@ -32,6 +32,12 @@ from app.config import get_settings
 from app.core.logging import get_logger
 from app.db.models import BackfillCheckpoint
 from app.db.session import get_session_factory
+from app.ingestion.key_pool import (
+    KeyCandidate,
+    iter_keys,
+    record_key_error,
+    record_key_success,
+)
 from app.ingestion.writer import OptionsChainWriter, get_writer
 from app.processing.session import RTH_TZ, _is_business_day, _now_eastern, session_close_today
 
@@ -172,6 +178,45 @@ def _normalize_definition_row(
     return row, instrument_id, registry_entry
 
 
+async def _resolve_candidates() -> list[KeyCandidate]:
+    """Resolve OPRA key candidates (env first, then DB pool). Empty on failure."""
+    try:
+        factory = get_session_factory()
+        async with factory() as session:
+            return await iter_keys(session, DATASET)
+    except Exception:  # noqa: BLE001 — degrade gracefully on DB failure
+        logger.exception("historical_backfill_key_pool_resolve_failed")
+        return []
+
+
+async def _record_candidate_success(candidate: KeyCandidate) -> None:
+    if candidate.source != "db":
+        return
+    try:
+        factory = get_session_factory()
+        async with factory() as session:
+            await record_key_success(session, candidate)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "historical_backfill_record_key_success_failed",
+            key_label=candidate.label,
+        )
+
+
+async def _record_candidate_error(candidate: KeyCandidate, error_msg: str) -> None:
+    if candidate.source != "db":
+        return
+    try:
+        factory = get_session_factory()
+        async with factory() as session:
+            await record_key_error(session, candidate, error_msg=error_msg)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "historical_backfill_record_key_error_failed",
+            key_label=candidate.label,
+        )
+
+
 async def run_historical_backfill(
     writer: OptionsChainWriter | None = None,
 ) -> dict[int, dict]:
@@ -188,14 +233,16 @@ async def run_historical_backfill(
     if settings.disable_historical_backfill:
         logger.info("historical_backfill_disabled")
         return registry
-    if not settings.opra_api_key:
-        logger.warning("historical_backfill_skipped_no_api_key")
-        return registry
 
     try:
         import databento as db
     except ImportError:
         logger.warning("databento_import_failed_for_backfill")
+        return registry
+
+    candidates = await _resolve_candidates()
+    if not candidates:
+        logger.warning("historical_backfill_skipped_no_api_key")
         return registry
 
     writer = writer or get_writer()
@@ -205,9 +252,58 @@ async def run_historical_backfill(
     end = datetime.now(UTC) - timedelta(minutes=30)
     start = end - timedelta(days=settings.historical_backfill_days)
 
-    client = db.Historical(key=settings.opra_api_key)
+    last_error: str | None = None
+    for candidate in candidates:
+        client = db.Historical(key=candidate.api_key)
+        try:
+            total_rows = await _run_definition_phase(
+                client,
+                writer=writer,
+                supported_symbols=settings.supported_symbols,
+                start=start,
+                end=end,
+                registry=registry,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+            logger.warning(
+                "historical_backfill_candidate_failed",
+                key_label=candidate.label,
+                error=last_error[:200],
+            )
+            await _record_candidate_error(candidate, last_error)
+            continue
+
+        await _record_candidate_success(candidate)
+        await writer.flush()
+        logger.info(
+            "historical_backfill_complete",
+            rows=total_rows,
+            registry_size=len(registry),
+            key_label=candidate.label,
+        )
+        return registry
+
+    if last_error is not None:
+        logger.warning(
+            "historical_backfill_all_candidates_failed",
+            error=last_error[:200],
+        )
+    return registry
+
+
+async def _run_definition_phase(
+    client,
+    *,
+    writer: OptionsChainWriter,
+    supported_symbols: list[str],
+    start: datetime,
+    end: datetime,
+    registry: dict[int, dict],
+) -> int:
+    """Pull definition rows for every parent symbol against an already-keyed client."""
     total_rows = 0
-    for underlying in settings.supported_symbols:
+    for underlying in supported_symbols:
         parent = _parent_symbol(underlying)
         df = None
         symbol_end = end
@@ -263,13 +359,7 @@ async def run_historical_backfill(
             if instrument_id is not None and reg_entry is not None:
                 registry[instrument_id] = reg_entry
 
-    await writer.flush()
-    logger.info(
-        "historical_backfill_complete",
-        rows=total_rows,
-        registry_size=len(registry),
-    )
-    return registry
+    return total_rows
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -428,9 +518,6 @@ async def run_historical_quotes_backfill(
     if settings.disable_historical_backfill:
         logger.info("historical_quotes_backfill_disabled")
         return 0
-    if not settings.opra_api_key:
-        logger.warning("historical_quotes_backfill_skipped_no_api_key")
-        return 0
     if not registry:
         logger.warning("historical_quotes_backfill_skipped_empty_registry")
         return 0
@@ -439,6 +526,11 @@ async def run_historical_quotes_backfill(
         import databento as db
     except ImportError:
         logger.warning("databento_import_failed_for_quotes_backfill")
+        return 0
+
+    candidates = await _resolve_candidates()
+    if not candidates:
+        logger.warning("historical_quotes_backfill_skipped_no_api_key")
         return 0
 
     window = _last_close_window()
@@ -459,7 +551,6 @@ async def run_historical_quotes_backfill(
         return 0
 
     writer = writer or get_writer()
-    client = db.Historical(key=settings.opra_api_key)
 
     logger.info(
         "historical_quotes_backfill_start",
@@ -467,8 +558,57 @@ async def run_historical_quotes_backfill(
         end=window_end.isoformat(),
     )
 
+    last_error: str | None = None
+    for candidate in candidates:
+        client = db.Historical(key=candidate.api_key)
+        try:
+            total_rows = await _run_quotes_phase(
+                client,
+                writer=writer,
+                registry=registry,
+                supported_symbols=settings.supported_symbols,
+                window_start=window_start,
+                window_end=window_end,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+            logger.warning(
+                "historical_quotes_backfill_candidate_failed",
+                key_label=candidate.label,
+                error=last_error[:200],
+            )
+            await _record_candidate_error(candidate, last_error)
+            continue
+
+        await _record_candidate_success(candidate)
+        await writer.flush()
+        logger.info(
+            "historical_quotes_backfill_complete",
+            rows=total_rows,
+            key_label=candidate.label,
+        )
+        return total_rows
+
+    if last_error is not None:
+        logger.warning(
+            "historical_quotes_backfill_all_candidates_failed",
+            error=last_error[:200],
+        )
+    return 0
+
+
+async def _run_quotes_phase(
+    client,
+    *,
+    writer: OptionsChainWriter,
+    registry: dict[int, dict],
+    supported_symbols: list[str],
+    window_start: datetime,
+    window_end: datetime,
+) -> int:
+    """Pull cmbp-1 / cbbo-1m / tcbbo NBBO snapshots against an already-keyed client."""
     total_rows = 0
-    for underlying in settings.supported_symbols:
+    for underlying in supported_symbols:
         parent = _parent_symbol(underlying)
 
         # Cost guardrail. cmbp-1 over OPRA can be heavy; bail if it would
@@ -688,6 +828,4 @@ async def run_historical_quotes_backfill(
             no_bid_ask=no_bid_ask,
         )
 
-    await writer.flush()
-    logger.info("historical_quotes_backfill_complete", rows=total_rows)
     return total_rows

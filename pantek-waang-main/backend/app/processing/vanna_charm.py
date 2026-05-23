@@ -203,15 +203,27 @@ def compute_charm(
     risk_free_rate: float = 0.05,
     today: pd.Timestamp | None = None,
     top_n: int = 5,
+    tau_years: float | None = None,
 ) -> GreekSummary:
-    """Aggregate dealer **Charm** exposure curve, in dollars per business day."""
+    """Aggregate dealer **Charm** exposure curve, in dollars per business day.
+
+    When ``tau_years`` is provided, every row's ``tau`` is overridden with
+    that value. This lets 0DTE callers pass a session-aware τ (e.g.
+    :func:`app.processing.session.time_to_expiry_0dte_years`) so the
+    per-strike CHARM_0DTE_LEVEL rows match the scalar
+    CHARM_0DTE_DECAY_RATE. ``None`` keeps the calendar-day floor used by
+    the multi-expiry default path.
+    """
     work, S = _prepare(df, weight_col=weight_col, today=today)
     if work is None:
         return _empty(weight_col)
 
     K = work["strike"].to_numpy(dtype=float)
     sigma = work["iv"].to_numpy(dtype=float)
-    tau = work["tau"].to_numpy(dtype=float)
+    if tau_years is not None and np.isfinite(tau_years) and tau_years > 0:
+        tau = np.full(len(work), float(tau_years), dtype=float)
+    else:
+        tau = work["tau"].to_numpy(dtype=float)
     weight = work["weight"].to_numpy(dtype=float)
     is_call = work["option_type"].astype(str).str.upper().to_numpy() == "C"
 

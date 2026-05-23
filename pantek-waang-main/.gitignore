@@ -50,7 +50,6 @@ pnpm-debug.log*
 *.env
 backend/.env
 frontend/.env
-public-site/.env
 !.env.example
 !.env.sample
 !*.env.example

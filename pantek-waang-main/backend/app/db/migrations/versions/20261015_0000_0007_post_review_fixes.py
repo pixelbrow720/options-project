@@ -52,17 +52,11 @@ def upgrade() -> None:
     # (destructive). Operators are expected to schedule a periodic
     # ``DELETE FROM <table> WHERE ts < NOW() - INTERVAL ...`` job; these
     # indexes keep that delete inexpensive.
-    op.create_index(
-        "ix_flow_events_ts_only",
-        "flow_events",
-        ["ts"],
-        if_not_exists=True,
+    op.execute(
+        "CREATE INDEX IF NOT EXISTS ix_flow_events_ts_only ON flow_events (ts)"
     )
-    op.create_index(
-        "ix_dead_letter_queue_ts_only",
-        "dead_letter_queue",
-        ["ts"],
-        if_not_exists=True,
+    op.execute(
+        "CREATE INDEX IF NOT EXISTS ix_dead_letter_queue_ts_only ON dead_letter_queue (ts)"
     )
 
     # ── pipeline_runs.duration_ms: Numeric(20, 3) -> double precision ──
@@ -88,16 +82,8 @@ def downgrade() -> None:
         postgresql_using="duration_ms::numeric(20,3)",
     )
 
-    op.drop_index(
-        "ix_dead_letter_queue_ts_only",
-        table_name="dead_letter_queue",
-        if_exists=True,
-    )
-    op.drop_index(
-        "ix_flow_events_ts_only",
-        table_name="flow_events",
-        if_exists=True,
-    )
+    op.execute("DROP INDEX IF EXISTS ix_dead_letter_queue_ts_only")
+    op.execute("DROP INDEX IF EXISTS ix_flow_events_ts_only")
 
     op.drop_constraint(
         "fk_access_requests_api_key_id",

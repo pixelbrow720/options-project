@@ -1,13 +1,7 @@
 import axios, { type AxiosInstance, type InternalAxiosRequestConfig } from "axios";
 
-// `__API_BASE__` lets ops set the API origin at runtime without a rebuild —
-// inject via `<script>window.__API_BASE__ = "..."</script>` in index.html
-// before the bundle is loaded, or via a docker entrypoint that templates the
-// HTML. Falls back to the build-time VITE_API_BASE_URL, then localhost dev.
-const baseURL =
-  (typeof window !== "undefined" && (window as unknown as { __API_BASE__?: string }).__API_BASE__) ||
-  import.meta.env.VITE_API_BASE_URL ||
-  "http://localhost:8000";
+// API base resolves at build time via Vite env. Falls back to localhost dev.
+const baseURL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
 export const TOKEN_STORAGE_KEY = "ofa_admin_token";
 
@@ -380,64 +374,5 @@ export const FuturesLevels = {
       },
     );
     return resp.data.data;
-  },
-};
-
-// ── Access Requests (Discord-verified user approval flow) ────────────────
-
-export type UserStatus = "pending" | "approved" | "rejected" | "banned";
-
-export interface AccessRequestUser {
-  id: number;
-  discord_id: string;
-  discord_username: string;
-  discord_avatar: string | null;
-  status: UserStatus;
-  guild_verified: boolean;
-  has_api_key: boolean;
-  api_key_label: string | null;
-  api_key_prefix: string | null;
-  created_at: string;
-  last_login_at: string | null;
-  notes: string | null;
-  access_request: {
-    id: number;
-    requested_at: string;
-    approved_at: string | null;
-    approved_by: string | null;
-    rejected_at: string | null;
-    rejected_by: string | null;
-    rejection_reason: string | null;
-  } | null;
-}
-
-export interface AccessRequestApproveResponse {
-  user: AccessRequestUser;
-  plaintext_key: string | null;
-}
-
-export const AccessRequests = {
-  async list(): Promise<AccessRequestUser[]> {
-    const resp = await api.get("/admin/access-requests");
-    return resp.data;
-  },
-  async approve(
-    userId: number,
-    payload: { api_key_id?: string; allowed_symbols?: string[] } = {},
-  ): Promise<AccessRequestApproveResponse> {
-    const resp = await api.post(`/admin/access-requests/${userId}/approve`, payload);
-    return resp.data;
-  },
-  async reject(userId: number, reason: string): Promise<{ user: AccessRequestUser }> {
-    const resp = await api.post(`/admin/access-requests/${userId}/reject`, { reason });
-    return resp.data;
-  },
-  async ban(userId: number, reason: string): Promise<{ user: AccessRequestUser }> {
-    const resp = await api.post(`/admin/users/${userId}/ban`, { reason });
-    return resp.data;
-  },
-  async revokeSessions(userId: number): Promise<{ revoked_count: number }> {
-    const resp = await api.post(`/admin/users/${userId}/revoke-sessions`);
-    return resp.data;
   },
 };

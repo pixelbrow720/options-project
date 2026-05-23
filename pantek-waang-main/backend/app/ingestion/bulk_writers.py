@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.dialects.postgresql import insert
@@ -68,7 +68,7 @@ class BulkUpsertWriter:
         # concurrent flushes can't issue overlapping upserts.
         self._flush_lock = asyncio.Lock()
         self._flushing: bool = False
-        self._last_flush_ts: datetime = datetime.utcnow()
+        self._last_flush_ts: datetime = datetime.now(UTC)
         self._shed_rows = 0
 
     @property
@@ -117,7 +117,7 @@ class BulkUpsertWriter:
                         return 0
                     batch = self._buffer
                     self._buffer = []
-                    self._last_flush_ts = datetime.utcnow()
+                    self._last_flush_ts = datetime.now(UTC)
 
                 if self.conflict_keys:
                     batch = self._dedupe_by(batch, self.conflict_keys)

@@ -454,6 +454,16 @@ async def _persist_metrics(
         result.move_tracker.realized_move is not None
         or result.move_tracker.implied_move is not None
     ):
+        move_extra: dict[str, object] = {
+            "underlying_price": result.move_tracker.underlying_price,
+            "open_price": result.move_tracker.open_price,
+            "realized_move": result.move_tracker.realized_move,
+            "implied_move": result.move_tracker.implied_move,
+            "implied_dte": result.move_tracker.implied_dte,
+            "ratio": result.move_tracker.ratio,
+        }
+        if result.move_tracker.reason is not None:
+            move_extra["reason"] = result.move_tracker.reason
         rows.append(
             {
                 "ts": ts,
@@ -463,14 +473,7 @@ async def _persist_metrics(
                 "expiration": sentinel_expiry,
                 "computed_at": ts,
                 "value": result.move_tracker.ratio,
-                "extra_json": {
-                    "underlying_price": result.move_tracker.underlying_price,
-                    "open_price": result.move_tracker.open_price,
-                    "realized_move": result.move_tracker.realized_move,
-                    "implied_move": result.move_tracker.implied_move,
-                    "implied_dte": result.move_tracker.implied_dte,
-                    "ratio": result.move_tracker.ratio,
-                },
+                "extra_json": move_extra,
             }
         )
 
@@ -489,11 +492,14 @@ async def _persist_metrics(
                     "extra_json": entry,
                 }
             )
-    elif not is_expiration_day(symbol):
-        # Sentinel row so EXPECTED_METRIC_TYPES sees PIN_PROBABILITY
-        # even on non-0DTE days. Subscribers can distinguish "no 0DTE
-        # today" (value is None + reason populated) from "computation
-        # failed" (metric type missing entirely).
+    else:
+        # Sentinel row so EXPECTED_METRIC_TYPES sees PIN_PROBABILITY even
+        # when the chain produced no rows. Distinguish "no 0DTE today"
+        # (non-expiration day) from "empty pin result" (expiration day
+        # but compute_pin_probability returned []).
+        reason = (
+            "empty_pin_result" if is_expiration_day(symbol) else "no_0dte_today"
+        )
         rows.append(
             {
                 "ts": ts,
@@ -503,7 +509,7 @@ async def _persist_metrics(
                 "expiration": sentinel_expiry,
                 "computed_at": ts,
                 "value": None,
-                "extra_json": {"reason": "no_0dte_today"},
+                "extra_json": {"reason": reason},
             }
         )
 

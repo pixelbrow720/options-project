@@ -2,8 +2,7 @@
 
 Options flow analytics platform for index options (SPXW, NDXP). Live + historical
 ingestion from Databento, TimescaleDB time-series storage, a derivatives metrics
-engine, REST + WebSocket + SSE API, plus two web frontends (admin + Discord-gated
-public site).
+engine, REST + WebSocket + SSE API, plus a React admin dashboard.
 
 This document is a structural map of what is in the repo, derived from reading
 the code. For a tutorial-style getting-started, see [README.md](README.md).
@@ -17,36 +16,27 @@ pantek-waang-main/
 ├── backend/              FastAPI app + processing engine + ingestion
 │   ├── app/
 │   │   ├── api/          HTTP / WS / SSE routers, schemas, deps, notifiers
-│   │   ├── core/         crypto, security, logging, discord client
+│   │   ├── core/         crypto, security, logging
 │   │   ├── db/           SQLAlchemy models, async session, alembic migrations
 │   │   ├── ingestion/    Databento live + historical + EOD-OI + bulk writers + DLQ + key pool
 │   │   ├── processing/   Pipeline + every metric calculator
 │   │   ├── config.py     Pydantic Settings (env-driven)
 │   │   └── main.py       App factory + lifespan + middleware
-│   ├── tests/            34+ test modules (unit + DB-backed)
+│   ├── tests/            Unit + DB-backed test modules
 │   ├── requirements.txt  Pinned deps (FastAPI 0.115, SQLAlchemy 2, databento 0.47…)
 │   ├── pyproject.toml    Ruff lint config
 │   └── Dockerfile
 │
 ├── frontend/             Vite + React 18 admin dashboard (port 3000)
 │   └── src/
-│       ├── pages/        Login, Dashboard, ApiKeys, AccessRequests, SystemStatus,
+│       ├── pages/        Login, Dashboard, ApiKeys, SystemStatus,
 │       │                 DataInspector, DatabentoKeys, Live, ZeroDte
 │       ├── components/   Layout + ui/ (shadcn) + live/ (chart panels)
 │       └── lib/          api.ts, AuthContext, streamClient, utils
 │
-├── public-site/          Vite + React 18 user-facing site (port 3001)
-│   └── src/
-│       ├── pages/        Landing, Login, Register, AuthCallback, Dashboard,
-│       │                 PendingApproval, Rejected, NotFound
-│       ├── components/   30+ visualization components (GEX, charm heatmap,
-│       │                 gamma compass, levels thermometer, options chain,
-│       │                 historical replay, etc.) + landing/ + ui/
-│       └── lib/          api, auth (zustand), stream, tickStream, theme, format
-│
 ├── docs/
 │   └── api_reference.md
-├── docker-compose.yml    db + backend + frontend + public-site
+├── docker-compose.yml    db + backend + frontend
 ├── openapi.json
 └── README.md
 ```
@@ -66,22 +56,20 @@ pantek-waang-main/
 | Scheduling       | APScheduler `AsyncIOScheduler`                          |
 | Math             | numpy, pandas, scipy (Black-Scholes inversion)          |
 | Ingestion        | databento 0.47 (Live + Historical)                      |
-| Auth             | bcrypt API keys, PyJWT for admin/session JWT, Fernet for at-rest secrets |
+| Auth             | bcrypt API keys, PyJWT for admin JWT, Fernet for at-rest secrets |
 | Rate limiting    | slowapi (per-key / per-IP) + custom sliding-window      |
 | Logging          | structlog (JSON)                                        |
 | Holiday calendar | `holidays` package (NYSE preferred, US federal fallback) |
-| HTTP client      | httpx (Discord OAuth + bot API)                         |
+| HTTP client      | httpx                                                   |
 
-### Frontends
-Both React 18 + TypeScript + Tailwind + shadcn/ui + Recharts. Public-site adds
-zustand, framer-motion, hls.js, lucide-react, radix tabs/dropdown/separator.
+### Frontend
+React 18 + TypeScript + Tailwind + shadcn/ui + Recharts.
 
 ### Infra
-Docker Compose with four services:
+Docker Compose with three services:
 - `db` (TimescaleDB, internal only)
 - `backend` (FastAPI on port 8000)
 - `frontend` (admin nginx on port 3000)
-- `public-site` (public nginx on port 3001)
 
 ---
 
@@ -112,12 +100,9 @@ Docker Compose with four services:
 | `dead_letter_queue`     | Unparsable ingestion payloads               |
 | `backfill_checkpoints`  | (dataset, symbol) → last_completed_at       |
 | `contract_adv`          | N-day ADV per contract (UOA threshold)      |
-| `users` (Rev 5)         | Discord-OAuth public users (status: pending/approved/rejected/banned) |
-| `access_requests` (Rev 5) | Audit trail of admin approval decisions   |
-| `user_sessions` (Rev 5) | Issued public-session JWTs (revocable)      |
 
-Migrations 0001 → 0006 (last is `0006_public_auth.py`). Migration 0005 added
-RTH/0DTE columns + key pool. Migration 0006 added Discord OAuth tables.
+Migrations 0001 → 0008. Migration 0008 drops the public-auth tables
+(`users`, `access_requests`, `user_sessions`) introduced in migration 0006.
 
 ---
 
@@ -219,7 +204,7 @@ All responses wrapped in `{symbol, computed_at, next_update_in_seconds, data}`.
 - `GET /v1/{symbol}/hiro` — cumulative signed premium series
 
 ### Streaming
-- `WS  /v1/{symbol}/stream` — pushes snapshot frames + 25s heartbeat. Auth via `X-API-Key` or `?key=`. Per-key cap `MAX_WS_CONNECTIONS_PER_KEY=5`. Initial REST snapshot primes the connection
+- `WS  /v1/{symbol}/stream` — pushes snapshot frames + 25s heartbeat. Auth via `X-API-Key` header or `?key=`. Per-key cap `MAX_WS_CONNECTIONS_PER_KEY=5`. Initial REST snapshot primes the connection
 - `GET /v1/{symbol}/stream/sse` — SSE fallback for proxy environments that strip WS upgrades
 
 ### Admin (require `Authorization: Bearer <jwt>`)
@@ -229,31 +214,15 @@ All responses wrapped in `{symbol, computed_at, next_update_in_seconds, data}`.
 - `GET    /admin/system/status` — Pipeline + ingestion + DB row counts + Rev 3 telemetry (futures_lag_ms, opra_lag_ms, dlq_pending, flow_events_last_hour, last_pipeline_runs[], live_ingester diagnostics)
 - `GET|POST|PATCH|DELETE /admin/databento-keys[/...]` — Failover pool CRUD
 - `POST   /admin/databento-keys/{id}/test` — Decryption sanity check
-- `GET    /admin/access-requests?pending_only=true` — Discord access requests
-- `POST   /admin/access-requests/{user_id}/approve` — assign or auto-create API key
-- `POST   /admin/access-requests/{user_id}/reject` — with reason, revokes sessions
-- `POST   /admin/users/{user_id}/ban` — disables bridged key + revokes sessions
-- `POST   /admin/users/{user_id}/revoke-sessions`
-- `GET    /admin/users[?status_filter=...]`
 - `GET    /admin/inspector` — Data Inspector: per-table row counts, metric breakdown, latest metrics, term structure, pin probability, flow events, alert events, chain-quality coverage, ingester diagnostics
-
-### Public-site auth (Discord OAuth — Rev 5)
-- `GET  /public/auth/discord/start` → `{url, state}` — signed CSRF state
-- `GET  /public/auth/discord/callback` — code exchange → upsert user → guild membership probe → 200 session OR 403 pending/rejected with invite URL + contact handles
-- `POST /public/auth/login` — legacy bridge: trade an admin-issued API key for a session JWT
-- `GET  /public/me` — authenticated user summary
-- `POST /public/auth/logout` — idempotent session revocation
-- `GET  /public/{symbol}/snapshot` | `/0dte` | `/futures-levels` | `/spot` | `/last-close` — same shapes as `/v1/...` but session-JWT authenticated. `/last-close` bypasses the RTH gate
-- `WS   /public/{symbol}/stream` — auth via `?token=<session-jwt>` query param
 
 ---
 
 ## Auth model
 
-### Three layers
+### Two layers
 1. **Admin JWT** — HS256 signed with `JWT_SECRET`, `JWT_EXPIRE_MINUTES=480` (8h). Bootstrap admin from `ADMIN_USERNAME` / `ADMIN_PASSWORD` (plaintext OR bcrypt hash starting with `$2`).
 2. **API key** (machine-to-machine) — generated as `ak_<urlsafe-token>`, bcrypt-hashed, only 11-char `key_prefix` stored in plaintext for display. Per-key `allowed_symbols` ACL. Plaintext shown ONCE at creation.
-3. **Public session JWT** (Rev 5) — separate `PUBLIC_SESSION_JWT_SECRET` (falls back to `JWT_SECRET`). Default lifetime 7 days. Bookkept in `user_sessions` for revocation. Bridges to an `api_keys` row for symbol ACL.
 
 ### Databento key pool (Fernet at rest)
 `databento_api_keys.api_key_encrypted` is Fernet-encrypted. The Fernet key is
@@ -267,15 +236,6 @@ Resolution order on every connect: env (`DATABENTO_API_KEY_OPRA` /
 matching dataset (`OPRA.PILLAR` / `GLBX.MDP3` / `BOTH`) by priority ASC. Keys
 with `error_count >= 5` are skipped for 30 min after `last_error_at`.
 
-### Discord OAuth flow (Rev 5)
-1. Public site calls `/public/auth/discord/start`, redirects to Discord with signed state
-2. Discord redirects back to `/auth/callback` with `code` + `state`
-3. Public site forwards to `/public/auth/discord/callback`
-4. Backend: validate state → exchange code → fetch user → guild-membership probe via bot token → upsert `users` + `access_requests` row
-5. If `status=approved` AND `guild_verified` AND has bridged `api_key_id` → issue session JWT
-6. Otherwise return 403 + `AccessPendingResponse` with invite URL and contact handles
-7. Admin uses `/admin/access-requests` to approve (auto-creates API key labelled `Public-{discord_username}` with default `["SPXW","NDXP"]`) or reject
-
 ---
 
 ## Frontend admin (`frontend/`, port 3000)
@@ -283,7 +243,6 @@ with `error_count >= 5` are skipped for 30 min after `last_error_at`.
 Routes from `App.tsx`, all wrapped in `<ProtectedRoute>` except `/login`:
 - `/` Dashboard — health + last compute + key + row counts
 - `/api-keys` — CRUD + one-time plaintext modal
-- `/access-requests` — approve/reject Discord users
 - `/system-status` — Rev 3 telemetry (5s polling)
 - `/data-inspector` — DLQ, metric breakdown, ingester sample-records, chain quality
 - `/databento-keys` — failover pool CRUD + priority arrows + status badge + test
@@ -292,29 +251,6 @@ Routes from `App.tsx`, all wrapped in `<ProtectedRoute>` except `/login`:
 
 `lib/streamClient.ts` provides `LiveSnapshotProvider` + `useLiveSnapshot` hook
 backed by the WS endpoint with REST snapshot prime on connect.
-
-## Public site (`public-site/`, port 3001)
-
-Routes from `App.tsx`:
-- `/` Landing (marketing) — hero / features / data teaser / access / footer + ticker
-- `/login` (PublicOnly)
-- `/register`
-- `/auth/callback` — completes Discord OAuth flow
-- `/pending` — friendly waiting screen with invite + contact handles
-- `/rejected`
-- `/dashboard` and `/dashboard/:symbol` — full SpotGamma-grade view with 30+ visualizations:
-  - SpotHero, FlipSpeedStrip, LevelsThermometer, KeyLevelsTable
-  - GexCurveChart, AbsoluteGammaChart, GammaCompass, GammaFlipTracker
-  - HiroChart, CharmHeatmap, DealerPositioning, PremiumFlowPanel
-  - PinRiskRadial, MoveTrackerCard, VolTriggerCard, SkewChart
-  - TermStructureChart, RegimeBadge, AlertCenter, TimeOfDayStrip
-  - StrikeMigration, FullChainHeatmap, OptionsChainTable
-  - HistoricalReplay, FuturesOverlayToggle, MarketClosedBanner
-- `/*` NotFound
-
-Auth state via zustand store (`lib/auth.ts`) with status-aware routing:
-`approved` → `/dashboard`, `pending` → `/pending`, `rejected` → `/rejected`,
-`banned` → toast + back to `/login`.
 
 ---
 
@@ -366,15 +302,7 @@ SPOT_BASIS_EMA_ALPHA=0.1
 ATM_BAND_PCT_0DTE=0.005
 OVERRIDE_RTH_GATE=false        DEV ONLY — bypass RTH gate
 
-# Discord OAuth (Rev 5)
-DISCORD_CLIENT_ID  DISCORD_CLIENT_SECRET  DISCORD_BOT_TOKEN  DISCORD_GUILD_ID
-DISCORD_REDIRECT_URI=http://localhost:3001/auth/callback
-DISCORD_INVITE_URL  DISCORD_CONTACT_HANDLES
-PUBLIC_SESSION_JWT_SECRET (optional, falls back to JWT_SECRET)
-PUBLIC_SESSION_EXPIRE_HOURS=168
-
 # CORS
-PUBLIC_CORS_ORIGINS=http://localhost:3001
 ADMIN_CORS_ORIGINS=http://localhost:3000
 
 # Misc
@@ -391,7 +319,7 @@ VITE_API_BASE_URL              baked into frontend at build time
 ### App lifespan (`main.py`)
 On startup (non-test mode):
 1. Configure structlog + install uvicorn log redaction (scrubs `token=`, `key=`, `code=`, `state=`, `Authorization` from query strings/log records)
-2. Warn (not fail) if `ADMIN_PASSWORD` / `JWT_SECRET` / `PUBLIC_SESSION_JWT_SECRET` are at known defaults
+2. Refuse to boot if `ADMIN_PASSWORD` / `JWT_SECRET` are at known defaults
 3. Start periodic flush loops for all bulk writers
 4. Run historical backfill (definitions + cmbp-1 NBBO)
 5. Run EOD OI ingestion
@@ -403,7 +331,7 @@ On shutdown: scheduler.shutdown → ingester.stop → cancel background tasks �
 
 ### Middleware
 - `_SecurityHeadersMiddleware` (pure ASGI) — HSTS, x-content-type-options, referrer-policy, x-frame-options DENY, permissions-policy, CSP (HTML-tight for `/docs` `/redoc`, JSON-strict otherwise)
-- `CORSMiddleware` — combined `PUBLIC_CORS_ORIGINS` + `ADMIN_CORS_ORIGINS`. `allow_credentials` flips to false if any origin is `*`
+- `CORSMiddleware` — `ADMIN_CORS_ORIGINS`. `allow_credentials` flips to false if any origin is `*`
 - `GZipMiddleware` — minimum 1KB
 
 ### Scheduler jobs
@@ -417,7 +345,7 @@ On shutdown: scheduler.shutdown → ingester.stop → cancel background tasks �
 
 ## Tests
 
-`backend/tests/` — 36 modules. Pure-function tests run without DB; DB-backed
+`backend/tests/` — pure-function tests run without DB; DB-backed
 tests need `TEST_DATABASE_URL` or auto-spin a Postgres testcontainer.
 
 Coverage areas:
@@ -429,7 +357,6 @@ Coverage areas:
 - `test_api_admin.py`, `test_api_auth.py`, `test_api_hardening.py`
 - `test_streaming_api.py`
 - `test_security.py`, `test_crypto.py`, `test_key_pool.py`
-- `test_public_auth.py`
 
 Lint with `ruff check app tests`. Frontend: `npm run lint && npm run typecheck && npm run build`.
 
@@ -455,5 +382,4 @@ python -m ruff check app tests
 
 # Frontend dev
 cd frontend && npm install && npm run dev      # admin on :3000
-cd public-site && npm install && npm run dev    # public on :3001
 ```

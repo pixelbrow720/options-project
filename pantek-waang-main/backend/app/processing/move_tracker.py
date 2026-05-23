@@ -39,6 +39,7 @@ class MoveSnapshot:
     implied_move: float | None
     implied_dte: int | None
     ratio: float | None
+    reason: str | None = None
 
 
 def compute_move_tracker(
@@ -53,23 +54,32 @@ def compute_move_tracker(
     ``strike, expiration, option_type, last_price, underlying_price``.
 
     ``open_price`` is the underlying's session-opening price. When the
-    caller cannot supply one (the chain DataFrame doesn't carry a
-    historical series — :mod:`app.processing.pipeline` overwrites
-    ``underlying_price`` with the *current* spot before invoking us)
-    ``realized_move`` is left as ``None`` so the website surfaces a
-    "no realized move yet" state instead of a silent zero.
+    caller cannot supply one we fall back to the earliest non-null
+    ``underlying_price`` row (assumed sorted by ``ts``) so realized_move
+    is at least directionally meaningful from the first chain snapshot
+    onward. If even that is unavailable we report ``reason =
+    "open_price_unset"`` and leave ``realized_move`` as ``None``.
 
     TODO: wire the 09:30 ET print in from a session-open hook
     (``reset_session_state`` is the natural place) so realized_move is
     populated for every tick after the first.
     """
     if chain.empty:
-        return MoveSnapshot(None, open_price, None, None, None, None)
+        return MoveSnapshot(None, open_price, None, None, None, None, "open_price_unset" if open_price is None else None)
 
     spot_series = chain["underlying_price"].dropna()
     if spot_series.empty:
-        return MoveSnapshot(None, open_price, None, None, None, None)
+        return MoveSnapshot(None, open_price, None, None, None, None, "open_price_unset" if open_price is None else None)
     S = float(spot_series.iloc[-1])
+
+    derived_reason: str | None = None
+    if open_price is None:
+        # Fall back to earliest non-null underlying_price in the chain.
+        first = float(spot_series.iloc[0])
+        if np.isfinite(first) and first > 0:
+            open_price = first
+        else:
+            derived_reason = "open_price_unset"
 
     realized = None
     if open_price is not None and open_price > 0 and np.isfinite(S):
@@ -78,14 +88,14 @@ def compute_move_tracker(
     if today is None:
         today_d = _today_eastern()
     else:
-        today_d = today.date() if hasattr(today, "date") else today
+        today_d = today.date()
 
     work = chain.copy()
     work["last_price"] = pd.to_numeric(work["last_price"], errors="coerce")
     work["strike"] = pd.to_numeric(work["strike"], errors="coerce")
     work = work[work["last_price"].notna() & work["strike"].notna()]
     if work.empty:
-        return MoveSnapshot(S, open_price, realized, None, None, None)
+        return MoveSnapshot(S, open_price, realized, None, None, None, derived_reason)
 
     # Find front expiry (smallest dte > 0).
     front_exp = None
@@ -101,15 +111,15 @@ def compute_move_tracker(
             front_dte = dte
             break
     if front_exp is None:
-        return MoveSnapshot(S, open_price, realized, None, None, None)
+        return MoveSnapshot(S, open_price, realized, None, None, None, derived_reason)
 
     front = work[work["expiration"] == front_exp]
     if front.empty:
-        return MoveSnapshot(S, open_price, realized, None, None, None)
+        return MoveSnapshot(S, open_price, realized, None, None, None, derived_reason)
 
     nearest = front.iloc[(front["strike"] - S).abs().argsort()]
     if nearest.empty:
-        return MoveSnapshot(S, open_price, realized, None, None, None)
+        return MoveSnapshot(S, open_price, realized, None, None, None, derived_reason)
     atm_strike = float(nearest.iloc[0]["strike"])
 
     atm_call = front[
@@ -121,12 +131,12 @@ def compute_move_tracker(
         & (front["option_type"].astype(str).str.upper() == "P")
     ]
     if atm_call.empty or atm_put.empty:
-        return MoveSnapshot(S, open_price, realized, None, front_dte, None)
+        return MoveSnapshot(S, open_price, realized, None, front_dte, None, derived_reason)
 
     call_p = float(atm_call.iloc[0]["last_price"])
     put_p = float(atm_put.iloc[0]["last_price"])
     if not (np.isfinite(call_p) and np.isfinite(put_p)):
-        return MoveSnapshot(S, open_price, realized, None, front_dte, None)
+        return MoveSnapshot(S, open_price, realized, None, front_dte, None, derived_reason)
 
     implied_total = call_p + put_p
     # Rescale to a single-day move when the front expiry is multi-day.
@@ -145,4 +155,5 @@ def compute_move_tracker(
         implied_move=float(daily_implied),
         implied_dte=int(front_dte) if front_dte is not None else None,
         ratio=ratio,
+        reason=derived_reason,
     )

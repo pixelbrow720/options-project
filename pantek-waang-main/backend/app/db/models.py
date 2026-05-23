@@ -90,6 +90,13 @@ class ComputedMetric(Base):
     __table_args__ = (
         Index("ix_computed_metrics_symbol_type_ts", "symbol", "metric_type", "ts"),
         Index(
+            "ix_computed_metrics_symbol_type_exp_ts",
+            "symbol",
+            "metric_type",
+            "expiration",
+            text("ts DESC"),
+        ),
+        Index(
             "ix_computed_metrics_0dte",
             "symbol",
             text("ts DESC"),
@@ -559,127 +566,4 @@ class ContractAdv(Base):
 
     __table_args__ = (
         Index("ix_contract_adv_symbol_expiry", "symbol", "expiration"),
-    )
-
-
-# ── Public auth (Rev 5) ─────────────────────────────────────────────────────
-#
-# Discord-OAuth-verified public users. The admin layer (``admin_users`` +
-# ``api_keys``) is unchanged — public users are bridged to an ``api_keys``
-# row when an admin approves them so the existing data endpoints keep
-# working with no special-casing of "public" vs "machine" callers.
-
-
-class User(Base):
-    """Public user authenticated via Discord OAuth.
-
-    Lifecycle:
-      * Discord callback (first time)  → status=``pending``, guild_verified
-        reflects whether they are in the configured Discord guild.
-      * Admin approves                 → status=``approved`` and an
-        ``api_keys`` row is assigned (auto-created if none provided).
-      * Admin rejects                  → status=``rejected`` (audit row in
-        ``access_requests``).
-      * Admin bans                     → status=``banned`` and all
-        ``user_sessions`` for the user are revoked.
-    """
-
-    __tablename__ = "users"
-
-    id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, autoincrement=True
-    )
-    discord_id: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
-    discord_username: Mapped[str] = mapped_column(Text, nullable=False)
-    discord_avatar: Mapped[str | None] = mapped_column(Text, nullable=True)
-    email: Mapped[str | None] = mapped_column(Text, nullable=True)
-    status: Mapped[str] = mapped_column(
-        Text, nullable=False, default="pending"
-    )
-    """``pending`` | ``approved`` | ``rejected`` | ``banned``."""
-    guild_verified: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False
-    )
-    api_key_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("api_keys.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
-    )
-    last_login_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    __table_args__ = (
-        Index("ix_users_discord_id", "discord_id"),
-        Index("ix_users_status", "status"),
-    )
-
-
-class AccessRequest(Base):
-    """Audit trail of approval / rejection decisions for a public user."""
-
-    __tablename__ = "access_requests"
-
-    id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, autoincrement=True
-    )
-    user_id: Mapped[int] = mapped_column(
-        BigInteger,
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    requested_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
-    )
-    approved_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    approved_by: Mapped[str | None] = mapped_column(Text, nullable=True)
-    rejected_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    rejected_by: Mapped[str | None] = mapped_column(Text, nullable=True)
-    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    api_key_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("api_keys.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-
-    __table_args__ = (
-        Index("ix_access_requests_user_id", "user_id"),
-    )
-
-
-class UserSession(Base):
-    """Issued public-session JWT bookkeeping. Used for revocation."""
-
-    __tablename__ = "user_sessions"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    user_id: Mapped[int] = mapped_column(
-        BigInteger,
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    issued_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
-    )
-    expires_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
-    revoked: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False
-    )
-    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
-    ip: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    __table_args__ = (
-        Index("ix_user_sessions_user_id", "user_id"),
     )

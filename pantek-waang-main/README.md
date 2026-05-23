@@ -250,22 +250,9 @@ npm run dev          # http://localhost:3000, proxies to VITE_API_BASE_URL
 
 ## FlowOptionID public site
 
-`public-site/` is the public-facing version of the platform — a separate Vite +
-React app aimed at end users (not admins). It runs alongside the admin UI:
-
-- **Admin dashboard** — `frontend/` on port `3000` (manage API keys, watch pipeline health).
-- **Public site** — `public-site/` on port `3001` (Discord-gated registration,
-  user-facing dashboards, API key self-service).
-
-Auth flow: visitor signs in with Discord → backend checks guild membership →
-admin approves the user from the dashboard → an API key is issued to the user
-via the public site. While Discord OAuth is unconfigured, the legacy
-`/public/auth/login` (API-key login) still works.
-
-Bring everything up with the same `docker compose up --build`. For free hosting
-of the public site (Netlify, Vercel, Cloudflare Pages) and the
-`flowoptionid.is-a.dev` domain workflow, see
-[`public-site/DEPLOY.md`](public-site/DEPLOY.md).
+The public-facing site has been retired. This repository now ships only the
+admin platform: backend, database, and admin dashboard. End-user data access
+is via API keys provisioned by the admin dashboard.
 
 ---
 

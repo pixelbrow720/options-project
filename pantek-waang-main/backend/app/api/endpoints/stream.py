@@ -20,16 +20,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-import uuid
 from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import (
     APIRouter,
-    Depends,
+    HTTPException,
     Path,
     Query,
+    Request,
     WebSocket,
     WebSocketDisconnect,
     status,
@@ -38,9 +38,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_symbol_access
 from app.api.endpoints.snapshot import build_snapshot_payload
-from app.api.endpoints.stream_ticket import get_ticket_store
 from app.api.stream_notifier import get_stream_notifier
 from app.config import get_settings
 from app.core.logging import get_logger
@@ -185,20 +183,14 @@ async def stream_ws(
     websocket: WebSocket,
     symbol: str = Path(..., min_length=1, max_length=20, pattern=_SYMBOL_PATTERN),
     key: str | None = Query(default=None),
-    ticket: str | None = Query(default=None),
 ) -> None:
     """Push a JSON frame whenever the pipeline completes a cycle for ``symbol``.
 
     Auth (in priority order):
-      * ``?ticket=<short-lived-ticket>`` — the preferred path. Clients
-        ``POST /v1/{symbol}/stream-ticket`` with their X-API-Key first
-        and pass the returned ticket here. The ticket is single-use, 60s
-        TTL, and binds to (api_key, symbol).
       * ``X-API-Key`` header — works for non-browser clients that can
         set custom headers on the upgrade.
-      * ``?key=...`` query param — legacy fallback. Logged as
-        deprecated; will be removed once browser clients have moved to
-        the ticket flow.
+      * ``?key=...`` query param — fallback for browser WebSocket clients
+        that cannot set custom headers.
 
     Close codes:
     * ``1008`` (policy violation) — missing / invalid auth, symbol ACL
@@ -208,42 +200,12 @@ async def stream_ws(
     """
     sym_u = symbol.upper()
     factory = get_session_factory()
-    api_key_row: ApiKey | None = None
 
-    if ticket:
-        principal_id = get_ticket_store().consume(
-            ticket, kind="api_key", symbol=sym_u
+    api_key_value = websocket.headers.get("x-api-key") or key
+    async with factory() as session:
+        api_key_row = await _authenticate_streaming_key(
+            api_key_value, sym_u, session
         )
-        if principal_id is not None:
-            try:
-                api_key_uuid = uuid.UUID(principal_id)
-            except (ValueError, TypeError):
-                api_key_uuid = None
-            if api_key_uuid is not None:
-                async with factory() as session:
-                    candidate = await session.get(ApiKey, api_key_uuid)
-                    if candidate is not None and candidate.is_active:
-                        if candidate.expires_at is not None:
-                            expires_at = candidate.expires_at
-                            if expires_at.tzinfo is None:
-                                expires_at = expires_at.replace(tzinfo=UTC)
-                            if expires_at >= datetime.now(UTC):
-                                api_key_row = candidate
-                        else:
-                            api_key_row = candidate
-
-    if api_key_row is None:
-        api_key_value = websocket.headers.get("x-api-key") or key
-        if key and not websocket.headers.get("x-api-key"):
-            logger.warning(
-                "stream_ws_legacy_key_query_param",
-                symbol=sym_u,
-                detail="Client used deprecated ?key= query param; migrate to ?ticket=",
-            )
-        async with factory() as session:
-            api_key_row = await _authenticate_streaming_key(
-                api_key_value, sym_u, session
-            )
 
     if api_key_row is None:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
@@ -366,14 +328,30 @@ async def stream_ws(
 
 @router.get("/v1/{symbol}/stream/sse")
 async def stream_sse(
+    request: Request,
     symbol: str = Path(..., min_length=1, max_length=20, pattern=_SYMBOL_PATTERN),
-    _api_key: ApiKey = Depends(require_symbol_access()),
+    key: str | None = Query(default=None),
 ) -> StreamingResponse:
-    """Server-Sent Events fallback for clients that cannot use WebSockets."""
+    """Server-Sent Events fallback for clients that cannot use WebSockets.
+
+    Auth (in priority order):
+      * ``X-API-Key`` header — works for non-browser clients.
+      * ``?key=...`` query param — fallback for browser ``EventSource``
+        clients that cannot set custom headers (mirrors the WS endpoint).
+    """
     sym_u = symbol.upper()
+
+    api_key_value = request.headers.get("x-api-key") or key
+    factory = get_session_factory()
+    async with factory() as session:
+        api_key_row = await _authenticate_streaming_key(
+            api_key_value, sym_u, session
+        )
+    if api_key_row is None:
+        raise HTTPException(status_code=401, detail="invalid_api_key")
+
     notifier = get_stream_notifier()
     queue = notifier.subscribe(sym_u)
-    factory = get_session_factory()
 
     async def _stream() -> Any:
         try:
