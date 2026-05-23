@@ -42,6 +42,7 @@ from app.ingestion.databento_historical import (
 )
 from app.ingestion.databento_live import get_live_ingester
 from app.ingestion.writer import get_writer
+from app.ingestion.dlq import get_dlq
 from app.processing.pipeline import run_pipeline_for_symbol
 from app.processing.scheduler import start_scheduler
 
@@ -110,6 +111,9 @@ async def lifespan(app: FastAPI):
         writer = get_writer()
         background_tasks.append(
             asyncio.create_task(writer.periodic_flush_loop(), name="writer_flush")
+        )
+        background_tasks.append(
+            asyncio.create_task(get_dlq().periodic_flush_loop(), name="dlq_flush")
         )
         for w in (
             get_futures_tick_writer(),
@@ -209,6 +213,10 @@ async def lifespan(app: FastAPI):
             await get_writer().flush()
         except Exception:  # noqa: BLE001
             logger.exception("final_flush_error")
+        try:
+            await get_dlq().flush()
+        except Exception:  # noqa: BLE001
+            logger.exception("dlq_final_flush_error")
         for w in (
             get_futures_tick_writer(),
             get_options_trade_writer(),

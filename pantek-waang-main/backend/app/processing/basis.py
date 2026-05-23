@@ -29,7 +29,7 @@ def compute_basis(*, spot: float | None, futures: float | None) -> BasisSnapshot
         return BasisSnapshot(spot=spot, futures=futures, basis=None, basis_pct=None)
     if not (spot > 0 and futures > 0):
         return BasisSnapshot(spot=spot, futures=futures, basis=None, basis_pct=None)
-    diff = float(futures) - float(spot)
+    diff = float(spot) - float(futures)
     return BasisSnapshot(
         spot=float(spot),
         futures=float(futures),

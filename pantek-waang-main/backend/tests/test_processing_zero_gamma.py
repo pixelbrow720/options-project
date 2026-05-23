@@ -118,3 +118,29 @@ def test_uses_oi_weight_when_requested():
     assert zg_v is not None and zg_o is not None
     # Same weights on both columns → identical zero-gamma price (modulo grid).
     assert abs(zg_v - zg_o) < 1e-6
+
+
+def test_zero_gamma_near_zero_iv():
+    """Near-zero IV contracts should not cause float overflow or crash."""
+    rows = []
+    rows.append(_row(strike=80, option_type="P", weight=10_000, iv=1e-12))
+    rows.append(_row(strike=120, option_type="C", weight=10_000, iv=1e-12))
+    df = pd.DataFrame(rows)
+    result = compute_zero_gamma(df, search_pct=0.40, fallback_to_closest=True)
+    assert result is None or math.isfinite(result)
+
+
+def test_zero_gamma_recursive_window_expansion():
+    """Recursively expand search window if no crossing is found in the initial small window (< 0.12)."""
+    rows = []
+    # With spot=100 and these strikes/weights, the zero crossing is around 93.8
+    rows.append(_row(strike=80, option_type="P", weight=10_000))
+    rows.append(_row(strike=110, option_type="C", weight=10_000))
+    df = pd.DataFrame(rows)
+
+    # If search_pct = 0.05 (window [95, 105]), crossing is outside the window.
+    # The function should dynamically expand search_pct to 0.12 (window [88, 112]),
+    # successfully locate the flip level around 93.8, and return it.
+    zg = compute_zero_gamma(df, search_pct=0.05, fallback_to_closest=False)
+    assert zg is not None
+    assert 90 < zg < 96

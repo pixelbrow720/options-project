@@ -156,7 +156,7 @@ def compute_charm_decay_rate(
         return 0.0
 
     tau = float(tau_years) if tau_years is not None else time_to_expiry_0dte_years()
-    tau = max(1.0 / 365.0, tau)
+    tau = max(15.0 / (365.25 * 24.0 * 60.0), tau)
 
     K = sub["strike"].to_numpy(dtype=float)
     sigma = sub["iv"].to_numpy(dtype=float)

@@ -41,7 +41,7 @@ class OptionsChain(Base):
         DateTime(timezone=True), primary_key=True, nullable=False
     )
     symbol: Mapped[str] = mapped_column(Text, primary_key=True, nullable=False)
-    expiration: Mapped[datetime] = mapped_column(Date, primary_key=True, nullable=False)
+    expiration: Mapped[date] = mapped_column(Date, primary_key=True, nullable=False)
     strike: Mapped[float] = mapped_column(Numeric(20, 6), primary_key=True, nullable=False)
     option_type: Mapped[str] = mapped_column(CHAR(1), primary_key=True, nullable=False)
 
@@ -122,11 +122,11 @@ class EodOpenInterest(Base):
     __tablename__ = "eod_open_interest"
 
     symbol: Mapped[str] = mapped_column(Text, primary_key=True, nullable=False)
-    expiration: Mapped[datetime] = mapped_column(Date, primary_key=True, nullable=False)
+    expiration: Mapped[date] = mapped_column(Date, primary_key=True, nullable=False)
     strike: Mapped[float] = mapped_column(Numeric(20, 6), primary_key=True, nullable=False)
     option_type: Mapped[str] = mapped_column(CHAR(1), primary_key=True, nullable=False)
 
-    oi_date: Mapped[datetime] = mapped_column(Date, nullable=False)
+    oi_date: Mapped[date] = mapped_column(Date, nullable=False)
     open_interest: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
 
     updated_at: Mapped[datetime] = mapped_column(
@@ -219,7 +219,7 @@ class OptionsTrade(Base):
         DateTime(timezone=True), primary_key=True, nullable=False
     )
     symbol: Mapped[str] = mapped_column(Text, primary_key=True, nullable=False)
-    expiration: Mapped[datetime] = mapped_column(Date, primary_key=True, nullable=False)
+    expiration: Mapped[date] = mapped_column(Date, primary_key=True, nullable=False)
     strike: Mapped[float] = mapped_column(Numeric(20, 6), primary_key=True, nullable=False)
     option_type: Mapped[str] = mapped_column(CHAR(1), primary_key=True, nullable=False)
     seq: Mapped[int] = mapped_column(BigInteger, primary_key=True, nullable=False)
@@ -251,7 +251,7 @@ class FlowEvent(Base):
         DateTime(timezone=True), nullable=False
     )
     symbol: Mapped[str] = mapped_column(Text, nullable=False)
-    expiration: Mapped[datetime] = mapped_column(Date, nullable=False)
+    expiration: Mapped[date] = mapped_column(Date, nullable=False)
     strike: Mapped[float] = mapped_column(Numeric(20, 6), nullable=False)
     option_type: Mapped[str] = mapped_column(CHAR(1), nullable=False)
 

@@ -243,10 +243,14 @@ def _row_price(row: pd.Series) -> float:
         and ask is not None
         and not pd.isna(bid)
         and not pd.isna(ask)
-        and bid > 0
-        and ask > bid
     ):
-        return float((bid + ask) / 2.0)
+        b_val = float(bid)
+        a_val = float(ask)
+        if b_val > 0 and a_val > b_val:
+            return (b_val + a_val) / 2.0
+        elif b_val == 0.0 and a_val > 0.0:
+            # Half-ask fallback when bid is zero (very common for cheap OTM options)
+            return a_val / 2.0
     last = row.get("last_price")
     if last is not None and not pd.isna(last) and last > 0:
         return float(last)
@@ -308,23 +312,31 @@ def fill_missing_iv(
     delta_missing = df["delta"].isna() | (df["delta"].fillna(0).abs() == 0)
     needs_greeks = iv_ok & spot_ok & strike_ok & (gamma_missing | delta_missing)
 
-    for idx in df.index[needs_greeks]:
-        row = df.loc[idx]
-        S = float(row["underlying_price"])
-        K = float(row["strike"])
-        sigma = float(row["iv"])
-        T = _years_to_expiry(today, pd.Timestamp(row["expiration"]))
-        is_call = str(row["option_type"]).upper() == "C"
-        cur_g = df.at[idx, "gamma"]
-        if pd.isna(cur_g) or float(cur_g) == 0:
-            g = bs_gamma(S, K, T, risk_free_rate, sigma)
-            if g is not None:
-                df.at[idx, "gamma"] = g
-        cur_d = df.at[idx, "delta"]
-        if pd.isna(cur_d) or float(cur_d) == 0:
-            d = bs_delta(S, K, T, risk_free_rate, sigma, is_call)
-            if d is not None:
-                df.at[idx, "delta"] = d
+    if needs_greeks.any():
+        sub = df.loc[needs_greeks]
+        S = sub["underlying_price"].to_numpy(dtype=float)
+        K = sub["strike"].to_numpy(dtype=float)
+        sigma = sub["iv"].to_numpy(dtype=float)
+        expirations = pd.to_datetime(sub["expiration"])
+        T = np.array([_years_to_expiry(today, exp) for exp in expirations], dtype=float)
+        is_call = sub["option_type"].astype(str).str.upper().to_numpy() == "C"
+        option_types = np.where(is_call, "C", "P")
+
+        # Vectorized calculation
+        gamma_vals = bsm.gamma(S, K, T, sigma, r=risk_free_rate)
+        delta_vals = bsm.delta(S, K, T, sigma, r=risk_free_rate, option_type=option_types)
+
+        # Set back to df, guarding against NaN or non-finite elements
+        df.loc[needs_greeks, "gamma"] = np.where(
+            df.loc[needs_greeks, "gamma"].isna() | (df.loc[needs_greeks, "gamma"] == 0),
+            gamma_vals,
+            df.loc[needs_greeks, "gamma"]
+        )
+        df.loc[needs_greeks, "delta"] = np.where(
+            df.loc[needs_greeks, "delta"].isna() | (df.loc[needs_greeks, "delta"] == 0),
+            delta_vals,
+            df.loc[needs_greeks, "delta"]
+        )
     return df
 
 

@@ -191,6 +191,7 @@ def synthesize_underlying_price(
     df: pd.DataFrame,
     *,
     risk_free_rate: float = 0.05,
+    dividend_yield: float = 0.015,
     today: pd.Timestamp | None = None,
     max_expiries: int = 3,
 ) -> float | None:
@@ -235,7 +236,7 @@ def synthesize_underlying_price(
         merged = merged.assign(diff=lambda d: (d["mid_c"] - d["mid_p"]).abs())
         atm = merged.sort_values("diff").iloc[0]
         K = float(atm["strike"])
-        spot = K * math.exp(-risk_free_rate * T) + float(atm["mid_c"]) - float(atm["mid_p"])
+        spot = math.exp(dividend_yield * T) * (K * math.exp(-risk_free_rate * T) + float(atm["mid_c"]) - float(atm["mid_p"]))
         if 1.0 < spot < 1e6 and math.isfinite(spot):
             candidates.append(spot)
 
@@ -353,18 +354,11 @@ def get_front_month_contract(
     if not candidates:
         return None
 
-    # Sort by expiry ascending → nearest expiry is the front month.
-    candidates.sort(key=lambda x: x[1])
-    nearest_expiry = candidates[0][1]
-    same_month = [c for c, e in candidates if e == nearest_expiry]
-    if len(same_month) == 1:
-        return same_month[0]
-
-    # Tie-break by recent volume (sum of last 100 ticks). If volume column
-    # absent, fall back to the alphabetical first contract — stable choice.
+    # Implement volume-based contract selection to support roll-overs automatically
     if "volume" in futures_df.columns:
+        candidate_names = [c for c, e in candidates]
         vols = (
-            futures_df[futures_df["contract_symbol"].isin(same_month)]
+            futures_df[futures_df["contract_symbol"].isin(candidate_names)]
             .groupby("contract_symbol")["volume"]
             .sum()
             .sort_values(ascending=False)
@@ -372,6 +366,10 @@ def get_front_month_contract(
         if not vols.empty:
             return str(vols.index[0])
 
+    # Fallback to nearest expiry
+    candidates.sort(key=lambda x: x[1])
+    nearest_expiry = candidates[0][1]
+    same_month = [c for c, e in candidates if e == nearest_expiry]
     return sorted(same_month)[0]
 
 
@@ -432,7 +430,9 @@ async def resolve_spot(
     # 1. Parity (always compute when we can — it both anchors the EMA basis
     #    and serves as the secondary path).
     parity_spot = synthesize_underlying_price(
-        chain_df, risk_free_rate=settings.risk_free_rate
+        chain_df,
+        risk_free_rate=settings.risk_free_rate,
+        dividend_yield=getattr(settings, "dividend_yield", 0.015),
     )
 
     # 2. Front-month futures last price.

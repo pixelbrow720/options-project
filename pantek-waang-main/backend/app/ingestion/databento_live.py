@@ -178,6 +178,8 @@ class DatabentoLiveIngester:
         # Terminal-failure flag — set after MAX_RECONNECTS or no schemas left.
         # Manual recovery via ``reset_after_terminal()``.
         self._dead: bool = False
+        # Keep strong references to background registry refresh tasks to prevent garbage collection
+        self._background_tasks: set[asyncio.Task] = set()
         # Counters surfaced via diagnostics for operator visibility.
         self._dropped_no_ts_count: int = 0
         self._unmatched_total: int = 0
@@ -719,7 +721,9 @@ class DatabentoLiveIngester:
             # streak — bounded by a cooldown so a noisy stream can't spam
             # bootstrap calls.
             if self._unmatched_total % 50 == 0:
-                await self._maybe_refresh_registry_for_misses()
+                task = asyncio.create_task(self._maybe_refresh_registry_for_misses())
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
             return
 
         price = _scale_price(getattr(record, "price", None))

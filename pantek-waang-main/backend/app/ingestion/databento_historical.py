@@ -234,6 +234,19 @@ async def run_historical_backfill(
         logger.info("historical_backfill_disabled")
         return registry
 
+    # Query completed checkpoints to prevent redundant API calls
+    completed_symbols: set[str] = set()
+    try:
+        from sqlalchemy import select
+        from app.db.models import BackfillCheckpoint
+        factory = get_session_factory()
+        async with factory() as session:
+            stmt = select(BackfillCheckpoint.symbol).where(BackfillCheckpoint.dataset == DATASET)
+            res = await session.execute(stmt)
+            completed_symbols = {s.upper() for s in res.scalars().all()}
+    except Exception:
+        logger.exception("historical_backfill_checkpoints_query_failed_degrading_gracefully")
+
     try:
         import databento as db
     except ImportError:
@@ -260,6 +273,7 @@ async def run_historical_backfill(
                 client,
                 writer=writer,
                 supported_symbols=settings.supported_symbols,
+                completed_symbols=completed_symbols,
                 start=start,
                 end=end,
                 registry=registry,
@@ -297,6 +311,7 @@ async def _run_definition_phase(
     *,
     writer: OptionsChainWriter,
     supported_symbols: list[str],
+    completed_symbols: set[str],
     start: datetime,
     end: datetime,
     registry: dict[int, dict],
@@ -304,6 +319,9 @@ async def _run_definition_phase(
     """Pull definition rows for every parent symbol against an already-keyed client."""
     total_rows = 0
     for underlying in supported_symbols:
+        if underlying.upper() in completed_symbols:
+            logger.info("historical_backfill_skipped_by_checkpoint", symbol=underlying)
+            continue
         parent = _parent_symbol(underlying)
         df = None
         symbol_end = end

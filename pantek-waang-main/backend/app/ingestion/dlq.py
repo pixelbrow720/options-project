@@ -38,6 +38,7 @@ class DeadLetterQueue:
     def __init__(self, *, max_size: int | None = None) -> None:
         settings = get_settings()
         capacity = max_size or settings.ingestion_dlq_max_size
+        self._max_capacity = capacity
         self._buffer: deque[dict[str, Any]] = deque(maxlen=capacity)
         self._lock = asyncio.Lock()
         self._flush_interval_s = 5.0
@@ -111,6 +112,11 @@ class DeadLetterQueue:
             # under sustained backpressure). The next flush tick replays it.
             async with self._lock:
                 self._pending_retry = batch + self._pending_retry
+                # Enforce OOM protection on retry buffer during sustained outages
+                if len(self._pending_retry) > self._max_capacity:
+                    excess = len(self._pending_retry) - self._max_capacity
+                    self._pending_retry = self._pending_retry[excess:]
+                    self._evicted_count += excess
             return 0
         return len(batch)
 

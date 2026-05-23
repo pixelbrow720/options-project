@@ -353,6 +353,24 @@ async def stream_sse(
     notifier = get_stream_notifier()
     queue = notifier.subscribe(sym_u)
 
+    async def _is_revoked(api_key_id: Any) -> bool:
+        """Return True if the API key has been deactivated/expired."""
+        try:
+            async with factory() as session:
+                row = await session.get(ApiKey, api_key_id)
+        except Exception:  # noqa: BLE001 - DB blip should not kick the client
+            logger.exception("stream_sse_revocation_check_failed", symbol=sym_u)
+            return False
+        if row is None or not row.is_active:
+            return True
+        if row.expires_at is not None:
+            expires_at = row.expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            if expires_at < datetime.now(UTC):
+                return True
+        return False
+
     async def _stream() -> Any:
         try:
             # Prime with the latest snapshot.
@@ -369,6 +387,8 @@ async def stream_sse(
                         queue.get(), timeout=HEARTBEAT_INTERVAL_SECONDS
                     )
                 except TimeoutError:
+                    if await _is_revoked(api_key_row.id):
+                        break
                     yield _sse_event(
                         {"type": "heartbeat", "ts": datetime.now(UTC).isoformat()},
                         event="heartbeat",

@@ -522,3 +522,66 @@ def test_sse_event_encoding_shape() -> None:
 
     encoded_event = stream_mod._sse_event({"x": 1}, event="heartbeat")
     assert encoded_event.startswith("event: heartbeat\ndata: ")
+
+
+def test_sse_stream_rejects_missing_api_key(monkeypatch) -> None:
+    """SSE without a valid X-API-Key must fail with 401."""
+    stream_mod.reset_ws_state_for_tests()
+    _patch_session_factory(monkeypatch)
+
+    async def _fake_auth(api_key, symbol, session):  # noqa: ARG001
+        return None
+
+    monkeypatch.setattr(stream_mod, "_authenticate_streaming_key", _fake_auth)
+
+    client = _build_ws_test_client()
+    try:
+        resp = client.get("/v1/SPXW/stream/sse")
+        assert resp.status_code == 401
+    finally:
+        client.close()
+
+
+def test_sse_stream_revocation(monkeypatch) -> None:
+    """SSE stream must terminate when the underlying API key is revoked."""
+    stream_mod.reset_ws_state_for_tests()
+    _patch_session_factory(monkeypatch)
+
+    class _FakeApiKey:
+        id = "sse-revocation-key"
+        is_active = True
+        expires_at = None
+        allowed_symbols = ["SPXW"]
+
+    async def _fake_auth(api_key, symbol, session):  # noqa: ARG001
+        return _FakeApiKey() if api_key == "ak_sse_revocation" else None
+
+    async def _empty_payload(session, symbol):  # noqa: ARG001
+        return {"gex": {}, "flow_events_last_hour": 0}, None
+
+    monkeypatch.setattr(stream_mod, "_authenticate_streaming_key", _fake_auth)
+    monkeypatch.setattr(stream_mod, "build_snapshot_payload", _empty_payload)
+    
+    # Speed up the heartbeat interval so we timeout and check revocation quickly
+    monkeypatch.setattr(stream_mod, "HEARTBEAT_INTERVAL_SECONDS", 0.05)
+
+    client = _build_ws_test_client()
+    plaintext = "ak_sse_revocation"
+    try:
+        # Use streaming get request to read SSE lines
+        with client.stream("GET", "/v1/SPXW/stream/sse", headers={"X-API-Key": plaintext}) as resp:
+            assert resp.status_code == 200
+            
+            # Read the lines from the stream. It should terminate because _FakeSession.get
+            # returns None, which triggers the revocation check to return True and break the loop.
+            lines = list(resp.iter_lines())
+            
+            # We expect to see the initial snapshot, and no more events because it terminates.
+            assert len(lines) > 0
+            initial_data = json.loads(lines[0].removeprefix("data: ").strip())
+            assert initial_data["symbol"] == "SPXW"
+            assert "gex" in initial_data["data"]
+        
+    finally:
+        client.close()
+

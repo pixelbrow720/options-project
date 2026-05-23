@@ -395,7 +395,7 @@ function openStream(
         return;
       }
       // Credential was revoked mid-stream — bail out, do not retry.
-      if (ev.code === WS_CLOSE_CREDENTIAL_REVOKED) {
+      if (ev.code === WS_CLOSE_CREDENTIAL_REVOKED || ev.code === 1008) {
         closed = true;
         handlers.onStatus("auth-failed");
         return;

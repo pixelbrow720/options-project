@@ -76,8 +76,8 @@ def test_compute_charm_decay_rate_atm_only() -> None:
     today = date(2026, 1, 15)
     df = _chain(today)
     zero, _ = split_by_expiry(df, today=today)
-    rate = compute_charm_decay_rate(zero, atm_band_pct=0.005)
-    # Each ATM row has charm=12 ⇒ |12| / (365·24) ≈ 0.00137.
+    rate = compute_charm_decay_rate(zero, atm_band_pct=0.005, tau_years=6.75 / (365.25 * 24.0))
+    # Each ATM row has charm ≈ 2.5 ⇒ |2.5| / (365·24) ≈ 0.00028.
     assert rate > 0.0
     assert rate < 0.01
 

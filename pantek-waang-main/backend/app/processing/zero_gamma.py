@@ -127,7 +127,8 @@ def compute_zero_gamma(
     drift = (r + 0.5 * sigma * sigma) * tau
     d1 = (log_ratio + drift[None, :]) / sigma_sqrt_tau[None, :]
     pdf = norm.pdf(d1)
-    gamma_grid = pdf / (s_grid[:, None] * sigma_sqrt_tau[None, :])
+    divisor = s_grid[:, None] * sigma_sqrt_tau[None, :]
+    gamma_grid = np.where(divisor > 1e-9, pdf / np.where(divisor > 1e-9, divisor, 1.0), 0.0)
 
     # Per-strike contribution to aggregate dollar-gamma at each grid point.
     contrib = (
@@ -150,6 +151,18 @@ def compute_zero_gamma(
     diffs = np.diff(signs)
     cross_idx = np.where(diffs != 0)[0]
     if cross_idx.size == 0:
+        if search_pct < 0.12:
+            res = compute_zero_gamma(
+                df,
+                weight_col=weight_col,
+                risk_free_rate=risk_free_rate,
+                today=today,
+                search_pct=0.12,
+                n_points=n_points,
+                fallback_to_closest=False,
+            )
+            if res is not None:
+                return res
         if not fallback_to_closest:
             return None
         # No sign flip inside the window: report the grid point with the

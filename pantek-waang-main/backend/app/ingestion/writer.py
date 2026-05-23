@@ -55,6 +55,8 @@ class OptionsChainWriter:
         # flush is mid-roundtrip, without two flushes racing each other.
         self._flush_lock = asyncio.Lock()
         self._flushing: bool = False
+        # Keep strong references to background flush tasks to prevent garbage collection
+        self._background_tasks: set[asyncio.Task] = set()
         self._last_flush_ts = datetime.now(UTC)
         self._last_event_ts: datetime | None = None
         self._row_counts: dict[str, int] = {}
@@ -96,7 +98,9 @@ class OptionsChainWriter:
             # Backpressure: kick a flush in the background BEFORE shedding so
             # the buffer drains and the next ``add()`` has a chance to land.
             # Guarded by ``_flushing`` to avoid stampede.
-            asyncio.create_task(self.flush())
+            task = asyncio.create_task(self.flush())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
         if shed:
             await record_dlq(
                 source="opra_live",
@@ -149,37 +153,46 @@ class OptionsChainWriter:
                             existing[k] = v
                 batch = list(deduped.values())
 
-                factory = get_session_factory()
-                async with factory() as session:
-                    stmt = insert(OptionsChain).values(batch)
-                    stmt = stmt.on_conflict_do_update(
-                        index_elements=["ts", "symbol", "expiration", "strike", "option_type"],
-                        set_={
-                            "oi": stmt.excluded.oi,
-                            "volume": stmt.excluded.volume,
-                            "iv": stmt.excluded.iv,
-                            "delta": stmt.excluded.delta,
-                            "gamma": stmt.excluded.gamma,
-                            "last_price": stmt.excluded.last_price,
-                            "bid": stmt.excluded.bid,
-                            "ask": stmt.excluded.ask,
-                            "underlying_price": stmt.excluded.underlying_price,
-                        },
-                    )
-                    try:
-                        await session.execute(stmt)
-                        await session.commit()
-                    except Exception as exc:  # noqa: BLE001
-                        await session.rollback()
-                        logger.exception("options_chain_write_failed", rows=len(batch))
-                        await record_dlq(
-                            source="opra_live",
-                            reason=f"flush_failed: {type(exc).__name__}",
-                            payload={"row_count": len(batch), "error": str(exc)[:500]},
+                try:
+                    factory = get_session_factory()
+                    async with factory() as session:
+                        stmt = insert(OptionsChain).values(batch)
+                        stmt = stmt.on_conflict_do_update(
+                            index_elements=["ts", "symbol", "expiration", "strike", "option_type"],
+                            set_={
+                                "oi": stmt.excluded.oi,
+                                "volume": stmt.excluded.volume,
+                                "iv": stmt.excluded.iv,
+                                "delta": stmt.excluded.delta,
+                                "gamma": stmt.excluded.gamma,
+                                "last_price": stmt.excluded.last_price,
+                                "bid": stmt.excluded.bid,
+                                "ask": stmt.excluded.ask,
+                                "underlying_price": stmt.excluded.underlying_price,
+                            },
                         )
-                        return 0
+                        try:
+                            await session.execute(stmt)
+                            await session.commit()
+                        except Exception:
+                            await session.rollback()
+                            raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("options_chain_write_failed", rows=len(batch))
+                    serializable_batch = [
+                        {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in row.items()}
+                        for row in batch
+                    ]
+                    await record_dlq(
+                        source="opra_live",
+                        reason=f"flush_failed: {type(exc).__name__}",
+                        payload={"row_count": len(batch), "error": str(exc)[:500], "batch": serializable_batch},
+                    )
+                    return 0
 
                 logger.info("options_chain_flushed", rows=len(batch))
+                async with self._lock:
+                    self._row_counts.clear()
                 return len(batch)
             finally:
                 self._flushing = False

@@ -68,6 +68,8 @@ class BulkUpsertWriter:
         # concurrent flushes can't issue overlapping upserts.
         self._flush_lock = asyncio.Lock()
         self._flushing: bool = False
+        # Keep strong references to background flush tasks to prevent garbage collection
+        self._background_tasks: set[asyncio.Task] = set()
         self._last_flush_ts: datetime = datetime.now(UTC)
         self._shed_rows = 0
 
@@ -93,7 +95,9 @@ class BulkUpsertWriter:
         if overflow and should_kick_flush:
             # Backpressure: kick a flush before shedding so the buffer
             # drains and subsequent ``add()`` calls have a chance to land.
-            asyncio.create_task(self.flush())
+            task = asyncio.create_task(self.flush())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
         if shed:
             await record_dlq(
                 source=self._dlq_source,
@@ -123,9 +127,30 @@ class BulkUpsertWriter:
                     batch = self._dedupe_by(batch, self.conflict_keys)
 
                 factory = get_session_factory()
-                async with factory() as session:
-                    await self._do_insert(session, batch)
-                return len(batch)
+                try:
+                    async with factory() as session:
+                        try:
+                            await self._do_insert(session, batch)
+                        except Exception:
+                            await session.rollback()
+                            raise
+                    return len(batch)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        "bulk_writer_flush_failed",
+                        table=self.model.__tablename__,
+                        rows=len(batch),
+                    )
+                    serializable_batch = [
+                        {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in row.items()}
+                        for row in batch
+                    ]
+                    await record_dlq(
+                        source=self._dlq_source,
+                        reason=f"flush_failed:{self.model.__tablename__}:{type(exc).__name__}",
+                        payload={"row_count": len(batch), "error": str(exc)[:500], "batch": serializable_batch},
+                    )
+                    return 0
             finally:
                 self._flushing = False
 
@@ -145,21 +170,8 @@ class BulkUpsertWriter:
                 )
             else:
                 stmt = stmt.on_conflict_do_nothing(index_elements=self.conflict_keys)
-        try:
-            await session.execute(stmt)
-            await session.commit()
-        except Exception as exc:  # noqa: BLE001
-            await session.rollback()
-            logger.exception(
-                "bulk_writer_flush_failed",
-                table=self.model.__tablename__,
-                rows=len(batch),
-            )
-            await record_dlq(
-                source=self._dlq_source,
-                reason=f"flush_failed:{self.model.__tablename__}:{type(exc).__name__}",
-                payload={"row_count": len(batch), "error": str(exc)[:500]},
-            )
+        await session.execute(stmt)
+        await session.commit()
 
     @staticmethod
     def _dedupe_by(batch: list[dict], keys: Sequence[str]) -> list[dict]:
