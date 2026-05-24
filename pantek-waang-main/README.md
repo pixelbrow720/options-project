@@ -1,16 +1,17 @@
-# Options Flow Analytics Platform
+# FlowGreeks Engine
 
 Backend foundation for an options analytics service: live + historical OPRA Pillar
 ingestion via [Databento](https://databento.com), TimescaleDB for time-series
-storage, a derivatives-metrics processing engine (GEX, max pain, walls, IV),
-and a secured REST API consumed by ATAS.NET / MotiveWave indicator plugins
-(out of scope for this phase). A React admin dashboard manages API keys and
-exposes pipeline health.
+storage, a derivatives-metrics processing engine (GEX, max pain, walls, IV, HIRO),
+and a secured REST + WebSocket + SSE API.
 
-> **Phase scope:** This repo covers the foundation only — pipeline, processing,
-> database, REST API, and admin dashboard. The ATAS.NET and MotiveWave indicator
-> plugins are deliberately **not** included; they will consume this API in a
-> follow-up phase.
+The frontend trader UI lives in a separate workspace (`flowgreeks-frontend`).
+This repo only exposes a contract — see [`contracts/README.md`](contracts/README.md).
+
+> **Phase scope:** This repo covers the backend only — pipeline, processing,
+> database, and API surface. The frontend admin / trader UI and any
+> indicator-plugin clients (ATAS.NET, MotiveWave, etc.) consume this API in
+> separate workspaces.
 
 ---
 
@@ -32,13 +33,14 @@ exposes pipeline health.
                          ┌────────▼─────────────┐        ┌────────▼─────────┐
                          │  Processing engine   │        │   FastAPI        │
                          │  GEX / MaxPain /     │───────▶│   /v1/* + admin  │
-                         │  Walls / IV / skew   │        │   X-API-Key, JWT │
+                         │  Walls / IV / HIRO   │        │   X-API-Key, JWT │
                          └──────────────────────┘        └────────┬─────────┘
                                                                   │
-                                                         ┌────────▼─────────┐
-                                                         │  React admin UI  │
-                                                         │  (Vite + shadcn) │
-                                                         └──────────────────┘
+                                                            REST / WS / SSE
+                                                                  │
+                                                                  ▼
+                                                       flowgreeks-frontend
+                                                       (separate repo)
 ```
 
 ---
@@ -53,10 +55,9 @@ exposes pipeline health.
 | Scheduling       | APScheduler `AsyncIOScheduler`                       |
 | Ingestion        | `databento` Python client (Live + Historical)        |
 | Math             | `numpy`, `pandas`, `scipy` (Black-Scholes inversion) |
-| Auth             | bcrypt-hashed API keys + JWT for admin dashboard     |
+| Auth             | bcrypt-hashed API keys + JWT for admin endpoints     |
 | Rate limiting    | `slowapi` (per-API-key minute window)                |
 | Logging          | Structured JSON via `structlog`                      |
-| Frontend         | Vite + React 18 + TypeScript + Tailwind + shadcn/ui  |
 | Containerization | Docker + Docker Compose                              |
 
 ---
@@ -76,16 +77,14 @@ Services:
 
 - **db** – TimescaleDB (PostgreSQL 15) – internal only
 - **backend** – FastAPI on `http://localhost:8000`
-- **frontend** – Admin dashboard on `http://localhost:3000`
 
 The backend container automatically runs `alembic upgrade head` on startup and
 then runs the historical backfill, starts the live Databento stream, and starts
 the 60s compute scheduler.
 
 If you don't have a Databento key yet, set `DISABLE_LIVE_INGESTION=true` and
-`DISABLE_HISTORICAL_BACKFILL=true` in `.env`. The API and admin dashboard will
-still come up cleanly; the data endpoints will return empty payloads until data
-is ingested.
+`DISABLE_HISTORICAL_BACKFILL=true` in `.env`. The API will still come up
+cleanly; the data endpoints will return empty payloads until data is ingested.
 
 ---
 
@@ -109,7 +108,6 @@ is ingested.
 | `DISABLE_LIVE_INGESTION`       | `false`                                | Set `true` to skip the live stream (dev/testing).           |
 | `DISABLE_HISTORICAL_BACKFILL`  | `false`                                | Set `true` to skip the historical pull (dev/testing).       |
 | `RATE_LIMIT_PER_MINUTE`        | `120`                                  | Per-API-key rate limit on `/v1/*`.                          |
-| `VITE_API_BASE_URL`            | `http://localhost:8000`                | Built into the frontend at build time.                      |
 | `GEX_REGIME_THRESHOLD`         | `0.2`                                  | Regime hysteresis deadband (Rev 3).                         |
 | `FLOW_SWEEP_MIN_PREMIUM`       | `50000`                                | Sweep detection floor in USD (Rev 3).                       |
 | `FLOW_BLOCK_MIN_SIZE`          | `100`                                  | Block detection floor in contracts (Rev 3).                 |
@@ -221,38 +219,19 @@ runs all four calculators, and upserts results into `computed_metrics`.
 
 ---
 
-## Admin dashboard
+## Frontend bridge
 
-```
-frontend/
-├── src/pages/Login.tsx
-├── src/pages/Dashboard.tsx
-├── src/pages/ApiKeys.tsx
-└── src/pages/SystemStatus.tsx
-```
+The trader UI and admin dashboard live in a separate repo
+(`flowgreeks-frontend`). Coupling between repos is the [`contracts/`](contracts/)
+folder:
 
-Features:
+- `contracts/types/snapshot.ts` — canonical TypeScript types
+- `contracts/samples/` — real-shape JSON payloads for offline frontend dev
+- `contracts/openapi.json` — auto-generated REST spec
+- `contracts/ws-frames.md` — WebSocket frame examples
 
-- JWT-based admin login (token stored in `localStorage`).
-- Dashboard with system health, last compute, total active keys, row counts.
-- API Keys table with create/edit/revoke and a one-time plaintext display modal.
-- Live System Status polling at 5s.
-
-For local development without Docker:
-
-```bash
-cd frontend
-npm install
-npm run dev          # http://localhost:3000, proxies to VITE_API_BASE_URL
-```
-
----
-
-## FlowOptionID public site
-
-The public-facing site has been retired. This repository now ships only the
-admin platform: backend, database, and admin dashboard. End-user data access
-is via API keys provisioned by the admin dashboard.
+When backend payload shapes change, update `contracts/types/snapshot.ts` and
+run `bash scripts/export_contracts.sh` to refresh the OpenAPI spec.
 
 ---
 
@@ -281,13 +260,12 @@ TEST_DATABASE_URL=postgresql+asyncpg://...   pytest    # adds DB-backed API/admi
 If `TEST_DATABASE_URL` is not set, the conftest will try to spin up a Postgres
 testcontainer. If Docker is not available, DB-backed tests are skipped and the
 pure-function tests still run. Pure-function tests cover the full processing
-engine (GEX, max pain, walls, IV) and the security primitives.
+engine (GEX, max pain, walls, IV, HIRO) and the security primitives.
 
 ### Lint
 
 ```bash
 cd backend && ruff check .
-cd frontend && npm run lint && npm run typecheck
 ```
 
 ---

@@ -1,8 +1,12 @@
-# Project Overview — pantek-waang
+# Project Overview — flowgreeks-engine
 
-Options flow analytics platform for index options (SPXW, NDXP). Live + historical
+Options flow analytics backend for index options (SPXW, NDXP). Live + historical
 ingestion from Databento, TimescaleDB time-series storage, a derivatives metrics
-engine, REST + WebSocket + SSE API, plus a React admin dashboard.
+engine, REST + WebSocket + SSE API.
+
+The frontend (admin + trader UI) lives in a separate workspace
+(`flowgreeks-frontend`). Coupling between the two is the `contracts/` folder
+(TS types + samples + OpenAPI + WS frame docs).
 
 This document is a structural map of what is in the repo, derived from reading
 the code. For a tutorial-style getting-started, see [README.md](README.md).
@@ -12,7 +16,7 @@ the code. For a tutorial-style getting-started, see [README.md](README.md).
 ## Repo layout
 
 ```
-pantek-waang-main/
+flowgreeks-engine/
 ├── backend/              FastAPI app + processing engine + ingestion
 │   ├── app/
 │   │   ├── api/          HTTP / WS / SSE routers, schemas, deps, notifiers
@@ -27,16 +31,17 @@ pantek-waang-main/
 │   ├── pyproject.toml    Ruff lint config
 │   └── Dockerfile
 │
-├── frontend/             Vite + React 18 admin dashboard (port 3000)
-│   └── src/
-│       ├── pages/        Login, Dashboard, ApiKeys, SystemStatus,
-│       │                 DataInspector, DatabentoKeys, Live, ZeroDte
-│       ├── components/   Layout + ui/ (shadcn) + live/ (chart panels)
-│       └── lib/          api.ts, AuthContext, streamClient, utils
+├── contracts/            Frontend bridge (read-only from frontend repo's POV)
+│   ├── types/snapshot.ts Canonical TS types for snapshot envelope + WS frames
+│   ├── samples/          Real-shape JSON payloads for frontend dev
+│   ├── openapi.json      Auto-generated REST spec
+│   ├── ws-frames.md      WebSocket frame docs
+│   └── README.md         Refresh + sync instructions
 │
+├── scripts/              export_contracts.sh and ops scripts
 ├── docs/
 │   └── api_reference.md
-├── docker-compose.yml    db + backend + frontend
+├── docker-compose.yml    db + backend
 ├── openapi.json
 └── README.md
 ```
@@ -45,7 +50,6 @@ pantek-waang-main/
 
 ## Stack
 
-### Backend
 | Layer            | Choice                                                  |
 |------------------|---------------------------------------------------------|
 | Runtime          | Python 3.11                                             |
@@ -62,14 +66,12 @@ pantek-waang-main/
 | Holiday calendar | `holidays` package (NYSE preferred, US federal fallback) |
 | HTTP client      | httpx                                                   |
 
-### Frontend
-React 18 + TypeScript + Tailwind + shadcn/ui + Recharts.
-
 ### Infra
-Docker Compose with three services:
+Docker Compose with two services:
 - `db` (TimescaleDB, internal only)
 - `backend` (FastAPI on port 8000)
-- `frontend` (admin nginx on port 3000)
+
+The frontend deploys separately from `flowgreeks-frontend`.
 
 ---
 
@@ -238,19 +240,24 @@ with `error_count >= 5` are skipped for 30 min after `last_error_at`.
 
 ---
 
-## Frontend admin (`frontend/`, port 3000)
+## Frontend bridge (`contracts/`)
 
-Routes from `App.tsx`, all wrapped in `<ProtectedRoute>` except `/login`:
-- `/` Dashboard — health + last compute + key + row counts
-- `/api-keys` — CRUD + one-time plaintext modal
-- `/system-status` — Rev 3 telemetry (5s polling)
-- `/data-inspector` — DLQ, metric breakdown, ingester sample-records, chain quality
-- `/databento-keys` — failover pool CRUD + priority arrows + status badge + test
-- `/live` — streaming dashboard with RTH banner, spot-source badge, GEX chart, walls cards, regime badge, flip-speed strip, expiration-day chip
-- `/0dte` — 0DTE-focused live view + futures-levels overlay
+The frontend lives in a separate workspace (`flowgreeks-frontend`). This repo
+only exposes a contract:
 
-`lib/streamClient.ts` provides `LiveSnapshotProvider` + `useLiveSnapshot` hook
-backed by the WS endpoint with REST snapshot prime on connect.
+- `contracts/types/snapshot.ts` — canonical TypeScript types for the snapshot
+  envelope, WS frames, and every payload sub-shape.
+- `contracts/samples/` — real-shape JSON payloads from a Databento pull
+  (currently `snapshot-spxw-friday.json` from Friday 2026-05-22 close).
+- `contracts/openapi.json` — auto-generated REST spec.
+- `contracts/ws-frames.md` — WebSocket frame examples and reconnection
+  semantics.
+
+When backend payload shapes change, update `contracts/types/snapshot.ts` and
+run `bash scripts/export_contracts.sh` to refresh the OpenAPI spec. The
+frontend repo treats `contracts/` as read-only.
+
+See `contracts/README.md` for the full endpoint table.
 
 ---
 
@@ -303,13 +310,12 @@ ATM_BAND_PCT_0DTE=0.005
 OVERRIDE_RTH_GATE=false        DEV ONLY — bypass RTH gate
 
 # CORS
-ADMIN_CORS_ORIGINS=http://localhost:3000
+ADMIN_CORS_ORIGINS=http://localhost:3000   # frontend dev URL — adjust for prod
 
 # Misc
 RATE_LIMIT_PER_MINUTE=120
 LOG_LEVEL=INFO
 ENABLE_OPENAPI_DOCS=true       set false in prod to hide /docs /redoc /openapi.json
-VITE_API_BASE_URL              baked into frontend at build time
 ```
 
 ---
@@ -358,14 +364,15 @@ Coverage areas:
 - `test_streaming_api.py`
 - `test_security.py`, `test_crypto.py`, `test_key_pool.py`
 
-Lint with `ruff check app tests`. Frontend: `npm run lint && npm run typecheck && npm run build`.
+Lint with `ruff check app tests`. Frontend lint/build lives in the
+`flowgreeks-frontend` repo.
 
 ---
 
 ## Quick commands
 
 ```bash
-# Full stack
+# Full stack (db + backend)
 docker compose up --build
 
 # Backend dev (requires running Postgres+TimescaleDB)
@@ -380,6 +387,6 @@ uvicorn app.main:app --reload
 APP_TESTING=1 python -m pytest -q
 python -m ruff check app tests
 
-# Frontend dev
-cd frontend && npm install && npm run dev      # admin on :3000
+# Refresh frontend contracts after payload shape changes
+bash scripts/export_contracts.sh
 ```

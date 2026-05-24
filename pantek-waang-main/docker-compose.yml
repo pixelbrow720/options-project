@@ -21,7 +21,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: ofa-backend
+    container_name: flowgreeks-engine
     restart: unless-stopped
     env_file:
       - .env
@@ -33,19 +33,6 @@ services:
         condition: service_healthy
     ports:
       - "8000:8000"
-
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-      args:
-        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
-    container_name: ofa-frontend
-    restart: unless-stopped
-    depends_on:
-      - backend
-    ports:
-      - "3000:80"
 
 volumes:
   db_data:

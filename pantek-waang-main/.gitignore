@@ -1,7 +1,6 @@
 # ──────────────────────────────────────────────────────────────────────
-# Project-local .gitignore for pantek-waang
-# (the repo-root .gitignore covers the parent layout; this one keeps the
-#  project self-contained if checked out on its own)
+# Project-local .gitignore for flowgreeks-engine (backend + contracts)
+# The frontend lives in a separate repo (flowgreeks-frontend).
 # ──────────────────────────────────────────────────────────────────────
 
 # ── Python (backend) ──────────────────────────────────────────────────
@@ -26,22 +25,8 @@ venv/
 env/
 ENV/
 
-# ── Node / Vite / TypeScript ──────────────────────────────────────────
-node_modules/
-dist/
-.vite/
-.parcel-cache/
-.next/
-.turbo/
-*.tsbuildinfo
-.eslintcache
-
 # Logs
 *.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
 
 # ── Env files ─────────────────────────────────────────────────────────
 .env
@@ -49,7 +34,6 @@ pnpm-debug.log*
 .env.*.local
 *.env
 backend/.env
-frontend/.env
 !.env.example
 !.env.sample
 !*.env.example
@@ -84,6 +68,10 @@ data/
 *.tgz
 *.7z
 *.rar
+
+# ── Contracts: large pulled-data parquet artifacts ────────────────────
+contracts/samples/*.parquet
+contracts/samples/*.dbn.zst
 
 # ── Misc ──────────────────────────────────────────────────────────────
 *.tmp
