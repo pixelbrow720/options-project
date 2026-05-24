@@ -1,0 +1,119 @@
+@import "tailwindcss";
+@import "./design-system/theme.css";
+@import "./design-system/glass.module.css";
+
+/* ─── Base reset ───────────────────────────────────────────────── */
+
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  html {
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    background: var(--color-bg-abyss);
+    color: var(--color-fg-primary);
+    /* Default to compact density; layout shell can override. */
+  }
+
+  body {
+    margin: 0;
+    min-height: 100dvh;
+    background: radial-gradient(
+        1200px 600px at 80% -10%,
+        rgba(124, 140, 255, 0.08) 0%,
+        transparent 60%
+      ),
+      radial-gradient(
+        900px 500px at 10% 110%,
+        rgba(63, 216, 197, 0.06) 0%,
+        transparent 60%
+      ),
+      var(--color-bg-abyss);
+    background-attachment: fixed;
+  }
+
+  /* Tabular numerals are the default everywhere. Components that need
+   * proportional digits opt-out with .font-prop. */
+  body,
+  table,
+  input,
+  button {
+    font-feature-settings: "tnum" 1, "lnum" 1, "ss01" 1;
+    font-variant-numeric: tabular-nums lining-nums;
+  }
+
+  ::selection {
+    background: rgba(124, 140, 255, 0.35);
+    color: var(--color-fg-primary);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent-indigo);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+
+  /* Reduced motion — kill every transition that isn't load-bearing. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+/* ─── Utilities ────────────────────────────────────────────────── */
+
+@layer utilities {
+  .font-numeric {
+    font-family: var(--font-mono);
+    font-feature-settings: "tnum" 1, "lnum" 1;
+    font-variant-numeric: tabular-nums lining-nums;
+  }
+
+  .font-prop {
+    font-feature-settings: "pnum" 1, "lnum" 1;
+    font-variant-numeric: proportional-nums lining-nums;
+  }
+
+  .text-long {
+    color: var(--color-long-strong);
+  }
+  .text-short {
+    color: var(--color-short-strong);
+  }
+  .bg-long-soft {
+    background-color: var(--color-long-soft);
+  }
+  .bg-short-soft {
+    background-color: var(--color-short-soft);
+  }
+
+  /* Invisible scrollbar variant for dense panes. Default browser
+   * scrollbars are visually loud on dark surfaces. */
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-border-strong) transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: var(--color-border-strong);
+    border-radius: 999px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <meta name="theme-color" content="#05070b" />
+    <meta name="robots" content="noindex,nofollow" />
+
+    <!-- Backend hosts. Replace at deploy via env or template. -->
+    <link rel="preconnect" href="%VITE_API_BASE_URL%" crossorigin />
+
+    <!-- Avoid FOUC: lock background color before CSS loads. -->
+    <style>
+      :root { color-scheme: dark; }
+      html, body { margin: 0; background: #05070b; color: #e6edf3; }
+      #root { min-height: 100dvh; }
+    </style>
+
+    <title>FlowGreeks</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

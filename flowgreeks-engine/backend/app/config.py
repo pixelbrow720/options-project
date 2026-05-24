@@ -1,0 +1,301 @@
+"""Application configuration loaded from environment variables."""
+
+from functools import lru_cache
+
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    # ── Databento ────────────────────────────────────────────────────────────
+    # ``DATABENTO_API_KEY`` is the legacy single-key fallback used when the
+    # dataset-specific keys below are not set. New deployments should set
+    # ``DATABENTO_API_KEY_OPRA`` (OPRA Pillar — options) and
+    # ``DATABENTO_API_KEY_GLOBEX`` (GLBX.MDP3 — CME futures) explicitly so each
+    # ingester authenticates with the correct subscription.
+    databento_api_key: str = Field(default="", alias="DATABENTO_API_KEY")
+    databento_api_key_opra: str = Field(default="", alias="DATABENTO_API_KEY_OPRA")
+    databento_api_key_globex: str = Field(default="", alias="DATABENTO_API_KEY_GLOBEX")
+
+    # ── Database ─────────────────────────────────────────────────────────────
+    database_url: str = Field(
+        default="postgresql+asyncpg://options:options@db:5432/options_db",
+        alias="DATABASE_URL",
+    )
+    # Connection-pool sizing for the async SQLAlchemy engine. Bumped from
+    # 5/5 → 20/20 because the OPRA writer + 4 bulk writers + scheduler +
+    # API handlers + WS streams contend for the same engine; the prior
+    # 10-conn ceiling head-of-line-blocked the live ingest path behind
+    # API reads. ``pool_pre_ping`` defaults to False — under high churn
+    # (every flush opens a session) the per-checkout SELECT 1 was a real
+    # round-trip cost; rely on ``pool_recycle`` instead. Operators behind
+    # a flaky connection can re-enable it via ``DB_POOL_PRE_PING=true``.
+    db_pool_size: int = Field(default=20, alias="DB_POOL_SIZE")
+    db_max_overflow: int = Field(default=20, alias="DB_MAX_OVERFLOW")
+    db_pool_recycle_seconds: int = Field(default=3600, alias="DB_POOL_RECYCLE_SECONDS")
+    db_pool_pre_ping: bool = Field(default=False, alias="DB_POOL_PRE_PING")
+
+    # ── Admin auth ───────────────────────────────────────────────────────────
+    admin_username: str = Field(default="admin", alias="ADMIN_USERNAME")
+    admin_password: str = Field(default="changeme", alias="ADMIN_PASSWORD")
+    jwt_secret: str = Field(default="dev-only-change-me", alias="JWT_SECRET")
+    # Default trimmed from 480 → 60 (Rev 8 SEC-2). Server-side revocation
+    # via the ``jwt_revocations`` table closes the leak window completely
+    # for ``/admin/logout``; the shorter TTL further bounds blast-radius
+    # for tokens that leak before logout. Operators wanting longer-lived
+    # tokens for headless tooling can override via env.
+    jwt_expire_minutes: int = Field(default=60, alias="JWT_EXPIRE_MINUTES")
+    jwt_algorithm: str = "HS256"
+
+    # ── DB-at-rest encryption ────────────────────────────────────────────────
+    # Independent of ``JWT_SECRET`` so the admin can rotate the JWT signing
+    # key without invalidating every encrypted Databento key in the pool.
+    # Empty string falls back to ``JWT_SECRET`` for backwards compatibility
+    # with deployments that pre-date this split — operators are expected to
+    # set ``DB_ENCRYPTION_KEY`` explicitly and run the re-encryption job
+    # before rotating ``JWT_SECRET``.
+    db_encryption_key: str = Field(default="", alias="DB_ENCRYPTION_KEY")
+
+    # ── Options config ───────────────────────────────────────────────────────
+    supported_symbols_raw: str = Field(default="SPXW,NDXP", alias="SUPPORTED_SYMBOLS")
+    risk_free_rate: float = Field(default=0.05, alias="RISK_FREE_RATE")
+    data_retention_days: int = Field(default=7, alias="DATA_RETENTION_DAYS")
+    compute_interval_seconds: int = Field(default=60, alias="COMPUTE_INTERVAL_SECONDS")
+    historical_backfill_days: int = Field(default=7, alias="HISTORICAL_BACKFILL_DAYS")
+
+    # ── Loader behavior ──────────────────────────────────────────────────────
+    # Window (in hours) the chain loader scans for the latest snapshot per
+    # contract. Tighter = less data scanned per pipeline tick. Default 6h
+    # gives a comfortable safety margin: during RTH every liquid contract
+    # updates sub-second, so anything older than 6h would be a contract
+    # that hasn't traded all session — its OI is already covered by the
+    # EOD-OI fallback table. Operators with extended-hours feeds may want
+    # to leave at the legacy 2-day value.
+    loader_snapshot_window_hours: int = Field(
+        default=6, alias="LOADER_SNAPSHOT_WINDOW_HOURS"
+    )
+
+    # ── Ingestion behavior ───────────────────────────────────────────────────
+    disable_live_ingestion: bool = Field(default=False, alias="DISABLE_LIVE_INGESTION")
+    disable_historical_backfill: bool = Field(default=False, alias="DISABLE_HISTORICAL_BACKFILL")
+
+    # ── Regime / processing thresholds ───────────────────────────────────────
+    # Score threshold (absolute value) below which the regime is reported as
+    # "neutral". Increase to add hysteresis around the zero-crossing and
+    # prevent flickering when GEX_NET_TOTAL is small and noisy.
+    gex_regime_threshold: float = Field(default=0.2, alias="GEX_REGIME_THRESHOLD")
+
+    # ── Flow event detection thresholds (Agent 3) ────────────────────────────
+    flow_sweep_min_premium: float = Field(
+        default=50_000.0, alias="FLOW_SWEEP_MIN_PREMIUM"
+    )
+    """Minimum dollar premium (size × price × 100) for a multi-leg cluster
+    to be flagged as a SWEEP. Sweeps are aggressive multi-venue prints."""
+
+    flow_block_min_size: int = Field(default=100, alias="FLOW_BLOCK_MIN_SIZE")
+    """Minimum single-print size (contracts) to be flagged as a BLOCK."""
+
+    flow_uoa_vol_oi_ratio: float = Field(
+        default=2.0, alias="FLOW_UOA_VOL_OI_RATIO"
+    )
+    """volume/OI ratio threshold for UOA classification when OI is known."""
+
+    # ── Ingestion / DB write tuning (Agent 4 / 6) ────────────────────────────
+    upsert_batch_size: int = Field(default=1000, alias="UPSERT_BATCH_SIZE")
+    """Batch size used by ``BulkUpsertWriter`` / ``OptionsChainWriter``."""
+
+    ingestion_max_pending_rows: int = Field(
+        default=10_000, alias="INGESTION_MAX_PENDING_ROWS"
+    )
+    """Hard cap on rows in any single writer's pending buffer. Past this we
+    log a WARNING and flush synchronously to apply backpressure."""
+
+    ingestion_dlq_max_size: int = Field(
+        default=1000, alias="INGESTION_DLQ_MAX_SIZE"
+    )
+    """Maximum dead-letter queue entries retained per ingester."""
+
+    ingestion_registry_refresh_seconds: int = Field(
+        default=4 * 60 * 60, alias="INGESTION_REGISTRY_REFRESH_SECONDS"
+    )
+    """How often the OPRA live ingester re-bootstraps its instrument registry
+    to pick up new intraday contracts. Default 4 hours during RTH."""
+
+    ingestion_quote_staleness_seconds: float = Field(
+        default=5.0, alias="INGESTION_QUOTE_STALENESS_SECONDS"
+    )
+    """Maximum age of a cached NBBO quote before the inline quote-rule
+    classifier in the OPRA trade path treats the book as stale and refuses
+    to compute side / signed_premium. Tighter values reduce stale-book
+    contamination at the cost of dropping classification on slow off-hours
+    feeds."""
+
+    # ── Live-ingester reconnect/recovery (REV8 OPS-1) ────────────────────────
+    ingestion_max_reconnects: int = Field(
+        default=30, alias="INGESTION_MAX_RECONNECTS"
+    )
+    """Maximum reconnect attempts before the live ingester gives up and
+    enters the auto cold-restart loop. With a 300s backoff cap this gives
+    roughly 30 minutes of routed-outage tolerance before a cold-restart
+    is attempted."""
+
+    ingestion_reconnect_max_backoff_seconds: float = Field(
+        default=300.0, alias="INGESTION_RECONNECT_MAX_BACKOFF_SECONDS"
+    )
+    """Cap on the exponential backoff between reconnect attempts. Bumped
+    from 60s to 300s so OPRA outages > 3min don't burn through the
+    reconnect budget in a tight loop."""
+
+    ingestion_terminal_reset_seconds: float = Field(
+        default=600.0, alias="INGESTION_TERMINAL_RESET_SECONDS"
+    )
+    """Sleep before auto-resetting the live ingester after the reconnect
+    budget is exhausted. The legacy ``reset_after_terminal()`` admin path
+    is preserved for forced cycles; this knob controls the unattended
+    recovery cadence."""
+
+    ingestion_dlq_retention_days: int = Field(
+        default=14, alias="INGESTION_DLQ_RETENTION_DAYS"
+    )
+    """Retention window for ``dead_letter_queue`` rows. Entries older than
+    this are eligible for cleanup via ``cleanup_dlq_older_than``. The
+    actual scheduling is wired by the lifespan task (Lane A)."""
+
+    futures_feed_lag_warn_ms: int = Field(
+        default=5_000, alias="FUTURES_FEED_LAG_WARN_MS"
+    )
+    """Log a WARNING when the freshest futures tick is older than this."""
+
+    # ── Streaming API (Agent 5) ──────────────────────────────────────────────
+    max_ws_connections_per_key: int = Field(
+        default=5, alias="MAX_WS_CONNECTIONS_PER_KEY"
+    )
+    """Cap on simultaneous WebSocket connections per API key."""
+
+    ws_revocation_check_interval_seconds: float = Field(
+        default=5.0, alias="WS_REVOCATION_CHECK_INTERVAL_SECONDS"
+    )
+    """How often the WS handlers re-poll ``api_keys`` to enforce mid-stream
+    revocation. Default trimmed from 30s → 5s in Rev 8 (SEC-6) so a
+    revoked key stops streaming within seconds. Trade-off: one DB
+    round-trip per active connection per interval — paired with the
+    Lane A single-watcher consolidation (ARCH-6) the load stays bounded.
+    """
+
+    # ── Request hardening (Rev 8 SEC-4) ──────────────────────────────────────
+    max_request_body_bytes: int = Field(
+        default=64 * 1024, alias="MAX_REQUEST_BODY_BYTES"
+    )
+    """Hard cap on request-body size enforced by ``BodySizeLimitMiddleware``.
+    Returns 413 when exceeded. Default 64 KiB — every JSON-bodied route in
+    this app (admin login, key creation, alert rules) is well under that.
+    Bump only if a route legitimately needs a larger payload."""
+
+    # ── Rev 4: RTH / 0DTE / spot resolver ────────────────────────────────────
+    rth_open_time: str = Field(default="09:30", alias="RTH_OPEN_TIME")
+    """RTH session open in America/New_York. Format ``HH:MM``."""
+
+    rth_close_time: str = Field(default="16:15", alias="RTH_CLOSE_TIME")
+    """RTH session close in America/New_York. SPX/NDX cash options stop
+    trading at 16:00 ET; we keep a 15-minute buffer so the last pipeline
+    tick still emits."""
+
+    spot_parity_deviation_warn_pct: float = Field(
+        default=0.5, alias="SPOT_PARITY_DEVIATION_WARN_PCT"
+    )
+    """Log a WARNING when the futures-basis spot vs. parity spot differ by
+    more than this percent. Helps detect feed problems."""
+
+    spot_stale_cache_max_age_seconds: float = Field(
+        default=300.0, alias="SPOT_STALE_CACHE_MAX_AGE_SECONDS"
+    )
+    """Reject a stale-cache spot fallback older than this. Default 5 min."""
+
+    spot_basis_ema_alpha: float = Field(
+        default=0.1, alias="SPOT_BASIS_EMA_ALPHA"
+    )
+    """Smoothing factor (0–1) for the cash-minus-futures basis EMA."""
+
+    atm_band_pct_0dte: float = Field(default=0.005, alias="ATM_BAND_PCT_0DTE")
+    """Half-width of the ATM band used by 0DTE charm-rate computation.
+    0.005 ⇒ ±0.5% of spot (so a 10-pt window at SPX ≈ 5000)."""
+
+    override_rth_gate: bool = Field(default=False, alias="OVERRIDE_RTH_GATE")
+    """Dev/testing only — when true, the scheduler skips the RTH gate and
+    runs the chain pipeline regardless of session state. Useful for
+    smoke-testing the analytics off-hours when the chain is stale but
+    still queryable. Never set in production."""
+
+    # ── Misc ─────────────────────────────────────────────────────────────────
+    rate_limit_per_minute: int = Field(default=120, alias="RATE_LIMIT_PER_MINUTE")
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+
+    trust_proxy_headers: bool = Field(default=False, alias="TRUST_PROXY_HEADERS")
+    """When True, the rate limiter and audit logging treat the first
+    ``X-Forwarded-For`` entry as the real client IP. Only enable this
+    behind a trusted reverse proxy (Cloudflare, an in-cluster ingress)
+    that strips client-supplied ``X-Forwarded-For`` headers — otherwise
+    a client can spoof their IP and bypass per-IP rate limits."""
+
+    admin_cors_origins: str = Field(
+        default="http://localhost:3000", alias="ADMIN_CORS_ORIGINS"
+    )
+    """Comma-separated list of allowed origins for the admin dashboard.
+
+    Set to a wildcard (``*``) only for local dev — production deployments
+    should pin this to the exact origins that should be able to call
+    the API.
+    """
+
+    enable_openapi_docs: bool = Field(
+        default=True, alias="ENABLE_OPENAPI_DOCS"
+    )
+    """When False, FastAPI's ``/docs``, ``/redoc`` and ``/openapi.json``
+    endpoints are disabled entirely. Recommended in production where
+    the schema does not need to be publicly browsable."""
+
+    @field_validator("supported_symbols_raw")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        return v.strip()
+
+    @property
+    def supported_symbols(self) -> list[str]:
+        return [s.strip().upper() for s in self.supported_symbols_raw.split(",") if s.strip()]
+
+    @property
+    def opra_api_key(self) -> str:
+        """API key used to authenticate against OPRA.PILLAR (options).
+
+        Falls back to the legacy ``DATABENTO_API_KEY`` so existing single-key
+        deployments keep working.
+        """
+        return self.databento_api_key_opra or self.databento_api_key
+
+    @property
+    def globex_api_key(self) -> str:
+        """API key used to authenticate against GLBX.MDP3 (CME futures).
+
+        Falls back to the legacy ``DATABENTO_API_KEY``.
+        """
+        return self.databento_api_key_globex or self.databento_api_key
+
+    @property
+    def admin_cors_origin_list(self) -> list[str]:
+        return [
+            o.strip()
+            for o in (self.admin_cors_origins or "").split(",")
+            if o.strip()
+        ]
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()

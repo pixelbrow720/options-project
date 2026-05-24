@@ -1,0 +1,141 @@
+/*
+ * FlowGreeks theme — Tailwind v4 @theme block.
+ *
+ * Tailwind v4 reads `@theme` and produces utilities (text-*, bg-*, etc.)
+ * directly from the CSS variables declared here. Keep this file in lock
+ * step with src/design-system/tokens.ts — TS code reads tokens.ts; CSS
+ * reads --variables. Both must agree.
+ */
+
+@theme {
+  /* ─── Backgrounds ────────────────────────────────────────────── */
+  --color-bg-abyss: #05070b;
+  --color-bg-base: #0a0e15;
+  --color-bg-raised: #0f141d;
+  --color-bg-sunken: #070a10;
+
+  /* ─── Foregrounds ────────────────────────────────────────────── */
+  --color-fg-primary: #e6edf3;
+  --color-fg-secondary: #9aa6b2;
+  --color-fg-muted: #6b7480;
+  --color-fg-inverse: #0a0e15;
+
+  /* ─── Borders ────────────────────────────────────────────────── */
+  --color-border-hairline: rgba(255, 255, 255, 0.06);
+  --color-border-subtle: rgba(255, 255, 255, 0.10);
+  --color-border-strong: rgba(255, 255, 255, 0.18);
+  --color-border-glow: rgba(140, 170, 255, 0.35);
+
+  /* ─── Accents ────────────────────────────────────────────────── */
+  --color-accent-cyan: #5cc7ff;
+  --color-accent-indigo: #7c8cff;
+  --color-accent-violet: #a07bff;
+  --color-accent-teal: #3fd8c5;
+
+  /* ─── Signed values (long/short) ─────────────────────────────── */
+  --color-long-strong: #27d97a;
+  --color-long-soft: rgba(39, 217, 122, 0.18);
+  --color-short-strong: #ff4d6d;
+  --color-short-soft: rgba(255, 77, 109, 0.18);
+  --color-flat: #7a8696;
+
+  /* ─── Status (NEVER reuse signed colors here) ────────────────── */
+  --color-info: #5cc7ff;
+  --color-success: #3fd8c5;
+  --color-warn: #ffb454;
+  --color-error: #ff7a90;
+
+  /* ─── Domain accents ─────────────────────────────────────────── */
+  --color-call-wall: #5cc7ff;
+  --color-put-wall: #ff85a1;
+  --color-max-pain: #ffd166;
+  --color-zero-gamma: #a07bff;
+  --color-spot: #e6edf3;
+  --color-futures: #9aa6b2;
+
+  /* ─── Radii ──────────────────────────────────────────────────── */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-pill: 9999px;
+
+  /* ─── Glass ──────────────────────────────────────────────────── */
+  --glass-blur-sm: 6px;
+  --glass-blur-md: 14px;
+  --glass-blur-lg: 24px;
+  --glass-blur-xl: 40px;
+  --glass-tint-cool: rgba(140, 170, 255, 0.04);
+  --glass-tint-warm: rgba(255, 200, 140, 0.04);
+  --glass-tint-neutral: rgba(255, 255, 255, 0.03);
+
+  /* ─── Shadows ────────────────────────────────────────────────── */
+  --shadow-resting:
+    0 1px 0 0 rgba(255, 255, 255, 0.04) inset,
+    0 4px 12px -8px rgba(0, 0, 0, 0.6);
+  --shadow-raised:
+    0 1px 0 0 rgba(255, 255, 255, 0.05) inset,
+    0 8px 24px -12px rgba(0, 0, 0, 0.7),
+    0 2px 6px -2px rgba(0, 0, 0, 0.5);
+  --shadow-floating:
+    0 1px 0 0 rgba(255, 255, 255, 0.07) inset,
+    0 16px 40px -16px rgba(0, 0, 0, 0.75),
+    0 4px 12px -4px rgba(0, 0, 0, 0.5);
+  --shadow-overlay:
+    0 1px 0 0 rgba(255, 255, 255, 0.08) inset,
+    0 32px 60px -24px rgba(0, 0, 0, 0.8),
+    0 8px 20px -6px rgba(0, 0, 0, 0.55);
+
+  /* ─── Motion ─────────────────────────────────────────────────── */
+  --duration-instant: 80ms;
+  --duration-fast: 140ms;
+  --duration-base: 200ms;
+  --duration-medium: 320ms;
+  --duration-slow: 600ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-decel: cubic-bezier(0, 0, 0.2, 1);
+  --ease-accel: cubic-bezier(0.4, 0, 1, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* ─── Type ───────────────────────────────────────────────────── */
+  --font-sans:
+    "Inter", "Inter Tight", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono:
+    "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* ─── z-index ────────────────────────────────────────────────── */
+  --z-base: 0;
+  --z-dropdown: 100;
+  --z-sticky: 200;
+  --z-overlay: 800;
+  --z-modal: 900;
+  --z-toast: 1000;
+  --z-tooltip: 1100;
+}
+
+/* Light theme overrides — applied when <html class="light">. Optional
+ * second-class citizen; dashboard is dark-first. */
+.light {
+  --color-bg-abyss: #f5f7fa;
+  --color-bg-base: #ffffff;
+  --color-bg-raised: #f8fafc;
+  --color-bg-sunken: #eef1f5;
+  --color-fg-primary: #0a0e15;
+  --color-fg-secondary: #4a5562;
+  --color-fg-muted: #6b7480;
+  --color-border-hairline: rgba(0, 0, 0, 0.06);
+  --color-border-subtle: rgba(0, 0, 0, 0.10);
+  --color-border-strong: rgba(0, 0, 0, 0.18);
+}
+
+/* Density mode — tighter spacing for the compact trader view. */
+.density-compact {
+  --row-h: 24px;
+  --gap-x: 6px;
+  --gap-y: 4px;
+}
+.density-comfortable {
+  --row-h: 32px;
+  --gap-x: 10px;
+  --gap-y: 8px;
+}

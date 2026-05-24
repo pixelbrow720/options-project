@@ -1,0 +1,111 @@
+/*
+ * Glassmorphism utilities — opt-in only.
+ *
+ * Reasoning: backdrop-filter is GPU-cheap on chrome surfaces but
+ * destroys legibility on dense numeric tables and triggers a
+ * compositor-layer cost when many cards stack. Use these classes ONLY
+ * on:
+ *   - top-level page chrome (header, side rail)
+ *   - card surfaces that hold low text density (status pills, mini KPIs)
+ *   - overlays (dialogs, command palette, tooltips)
+ *
+ * NEVER apply on a virtualized strike grid, an option chain, or a
+ * scrollable trade tape. There the cost is per-row and the compositor
+ * thrashes.
+ *
+ * Performance: backdrop-filter requires the underlying surface to be a
+ * separate compositor layer. Tailwind v4's `transform-gpu` plus an
+ * explicit `will-change: backdrop-filter` keeps Chrome from
+ * re-rasterising on scroll.
+ */
+
+.glass {
+  /* Base — frosted, not opaque. Tint is a hair of color so the surface
+   * never looks like flat black under bright wallpaper backgrounds. */
+  background: var(--glass-tint-neutral);
+  backdrop-filter: blur(var(--glass-blur-md)) saturate(1.4);
+  -webkit-backdrop-filter: blur(var(--glass-blur-md)) saturate(1.4);
+  border: 1px solid var(--color-border-subtle);
+  box-shadow: var(--shadow-resting);
+  border-radius: var(--radius-lg);
+  will-change: backdrop-filter;
+}
+
+.glass-raised {
+  background: var(--glass-tint-neutral);
+  backdrop-filter: blur(var(--glass-blur-lg)) saturate(1.5);
+  -webkit-backdrop-filter: blur(var(--glass-blur-lg)) saturate(1.5);
+  border: 1px solid var(--color-border-subtle);
+  box-shadow: var(--shadow-raised);
+  border-radius: var(--radius-lg);
+  will-change: backdrop-filter;
+}
+
+.glass-overlay {
+  background: rgba(10, 14, 21, 0.72);
+  backdrop-filter: blur(var(--glass-blur-xl)) saturate(1.6);
+  -webkit-backdrop-filter: blur(var(--glass-blur-xl)) saturate(1.6);
+  border: 1px solid var(--color-border-subtle);
+  box-shadow: var(--shadow-overlay);
+  border-radius: var(--radius-lg);
+}
+
+/* Gradient hairline — use as a child pseudo-element so it doesn't fight
+ * with backdrop-filter. Compose by adding `.glass-border` alongside one
+ * of the surfaces above. */
+.glass-border {
+  position: relative;
+  isolation: isolate;
+}
+.glass-border::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(
+    135deg,
+    var(--color-border-glow) 0%,
+    var(--color-border-subtle) 35%,
+    transparent 70%
+  );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Reduced-motion / reduced-transparency fallback. Browsers that report
+ * `prefers-reduced-transparency` get a flat surface — backdrop-filter
+ * is replaced with a solid raised tone. */
+@media (prefers-reduced-transparency: reduce) {
+  .glass,
+  .glass-raised,
+  .glass-overlay {
+    background: var(--color-bg-raised);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+
+/* Inner highlight — a subtle 1px specular line on the top edge that
+ * sells the "frosted glass refraction" effect on dark backgrounds. */
+.glass-specular::after {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.18) 50%,
+    transparent 100%
+  );
+  pointer-events: none;
+}
