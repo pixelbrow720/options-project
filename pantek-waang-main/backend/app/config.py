@@ -29,14 +29,18 @@ class Settings(BaseSettings):
         default="postgresql+asyncpg://options:options@db:5432/options_db",
         alias="DATABASE_URL",
     )
-    # Connection-pool sizing for the async SQLAlchemy engine. Defaults are
-    # conservative for a single-pod prod deployment under moderate load
-    # (~ a few req/s sustained, occasional bursts). Operators running a
-    # larger fleet should raise these via env vars.
-    db_pool_size: int = Field(default=5, alias="DB_POOL_SIZE")
-    db_max_overflow: int = Field(default=5, alias="DB_MAX_OVERFLOW")
+    # Connection-pool sizing for the async SQLAlchemy engine. Bumped from
+    # 5/5 → 20/20 because the OPRA writer + 4 bulk writers + scheduler +
+    # API handlers + WS streams contend for the same engine; the prior
+    # 10-conn ceiling head-of-line-blocked the live ingest path behind
+    # API reads. ``pool_pre_ping`` defaults to False — under high churn
+    # (every flush opens a session) the per-checkout SELECT 1 was a real
+    # round-trip cost; rely on ``pool_recycle`` instead. Operators behind
+    # a flaky connection can re-enable it via ``DB_POOL_PRE_PING=true``.
+    db_pool_size: int = Field(default=20, alias="DB_POOL_SIZE")
+    db_max_overflow: int = Field(default=20, alias="DB_MAX_OVERFLOW")
     db_pool_recycle_seconds: int = Field(default=3600, alias="DB_POOL_RECYCLE_SECONDS")
-    db_pool_pre_ping: bool = Field(default=True, alias="DB_POOL_PRE_PING")
+    db_pool_pre_ping: bool = Field(default=False, alias="DB_POOL_PRE_PING")
 
     # ── Admin auth ───────────────────────────────────────────────────────────
     admin_username: str = Field(default="admin", alias="ADMIN_USERNAME")
@@ -45,12 +49,33 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = Field(default=480, alias="JWT_EXPIRE_MINUTES")
     jwt_algorithm: str = "HS256"
 
+    # ── DB-at-rest encryption ────────────────────────────────────────────────
+    # Independent of ``JWT_SECRET`` so the admin can rotate the JWT signing
+    # key without invalidating every encrypted Databento key in the pool.
+    # Empty string falls back to ``JWT_SECRET`` for backwards compatibility
+    # with deployments that pre-date this split — operators are expected to
+    # set ``DB_ENCRYPTION_KEY`` explicitly and run the re-encryption job
+    # before rotating ``JWT_SECRET``.
+    db_encryption_key: str = Field(default="", alias="DB_ENCRYPTION_KEY")
+
     # ── Options config ───────────────────────────────────────────────────────
     supported_symbols_raw: str = Field(default="SPXW,NDXP", alias="SUPPORTED_SYMBOLS")
     risk_free_rate: float = Field(default=0.05, alias="RISK_FREE_RATE")
     data_retention_days: int = Field(default=7, alias="DATA_RETENTION_DAYS")
     compute_interval_seconds: int = Field(default=60, alias="COMPUTE_INTERVAL_SECONDS")
     historical_backfill_days: int = Field(default=7, alias="HISTORICAL_BACKFILL_DAYS")
+
+    # ── Loader behavior ──────────────────────────────────────────────────────
+    # Window (in hours) the chain loader scans for the latest snapshot per
+    # contract. Tighter = less data scanned per pipeline tick. Default 6h
+    # gives a comfortable safety margin: during RTH every liquid contract
+    # updates sub-second, so anything older than 6h would be a contract
+    # that hasn't traded all session — its OI is already covered by the
+    # EOD-OI fallback table. Operators with extended-hours feeds may want
+    # to leave at the legacy 2-day value.
+    loader_snapshot_window_hours: int = Field(
+        default=6, alias="LOADER_SNAPSHOT_WINDOW_HOURS"
+    )
 
     # ── Ingestion behavior ───────────────────────────────────────────────────
     disable_live_ingestion: bool = Field(default=False, alias="DISABLE_LIVE_INGESTION")

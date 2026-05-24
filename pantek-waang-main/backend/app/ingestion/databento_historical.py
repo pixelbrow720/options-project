@@ -26,6 +26,7 @@ from datetime import UTC, date, datetime, timedelta
 from datetime import time as dtime
 
 import pandas as pd
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import get_settings
@@ -237,8 +238,6 @@ async def run_historical_backfill(
     # Query completed checkpoints to prevent redundant API calls
     completed_symbols: set[str] = set()
     try:
-        from sqlalchemy import select
-        from app.db.models import BackfillCheckpoint
         factory = get_session_factory()
         async with factory() as session:
             stmt = select(BackfillCheckpoint.symbol).where(BackfillCheckpoint.dataset == DATASET)

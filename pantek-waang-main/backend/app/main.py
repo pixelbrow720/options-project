@@ -41,8 +41,8 @@ from app.ingestion.databento_historical import (
     run_historical_quotes_backfill,
 )
 from app.ingestion.databento_live import get_live_ingester
-from app.ingestion.writer import get_writer
 from app.ingestion.dlq import get_dlq
+from app.ingestion.writer import get_writer
 from app.processing.pipeline import run_pipeline_for_symbol
 from app.processing.scheduler import start_scheduler
 
@@ -278,6 +278,14 @@ class _SecurityHeadersMiddleware:
         b"default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
     )
 
+    # Paths that legitimately need the relaxed HTML CSP (Swagger / ReDoc
+    # render inline JS + CSS). Any other HTML response gets the strict
+    # JSON CSP — closing the door on a future static page silently
+    # inheriting Swagger's relaxation.
+    _HTML_CSP_PATHS: frozenset[str] = frozenset(
+        {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
+    )
+
     def __init__(self, app):
         self.app = app
 
@@ -285,6 +293,9 @@ class _SecurityHeadersMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+
+        path = scope.get("path", "")
+        is_html_csp_path = path in self._HTML_CSP_PATHS
 
         async def send_with_headers(message):
             if message["type"] == "http.response.start":
@@ -299,7 +310,11 @@ class _SecurityHeadersMiddleware:
                         if k.lower() == b"content-type":
                             content_type = v.lower()
                             break
-                    if b"text/html" in content_type:
+                    # Only relax CSP for the explicit Swagger/ReDoc path
+                    # set AND when the response is HTML — both conditions
+                    # must hold. Anything else (custom error pages,
+                    # future static surface) gets the strict JSON CSP.
+                    if is_html_csp_path and b"text/html" in content_type:
                         headers.append(
                             (b"content-security-policy", self._HTML_CSP)
                         )

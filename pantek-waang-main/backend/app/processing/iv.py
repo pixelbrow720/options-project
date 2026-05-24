@@ -20,6 +20,7 @@ References:
 
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import dataclass
 
@@ -27,6 +28,8 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import brentq
 from scipy.stats import norm
+
+from app.processing import bsm
 
 # Reasonable IV bounds: 1% – 500% annualized.
 IV_LOWER_BOUND = 0.01
@@ -107,6 +110,35 @@ def _bs_price(S: float, K: float, T: float, r: float, sigma: float, is_call: boo
     return K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
 
 
+def _brenner_subrahmanyam_seed(
+    *, price: float, S: float, K: float, T: float
+) -> float:
+    """Closed-form approximation for σ from Brenner & Subrahmanyam (1988).
+
+    For an at-the-money option::
+
+        σ ≈ √(2π / T) · (price / S)
+
+    For non-ATM contracts the formula degrades smoothly — we still use
+    it as a seed for Newton-Raphson because a *reasonable* seed beats
+    the fixed σ = 0.25 default for deep ITM/OTM strikes where the price
+    landscape is far from the ATM regime. We clip into
+    ``[IV_LOWER_BOUND, IV_UPPER_BOUND]`` so a degenerate input cannot
+    immediately push Newton off the rails.
+    """
+    if T <= 0 or S <= 0 or price <= 0:
+        return 0.25
+    raw = math.sqrt(2.0 * math.pi / T) * (price / S)
+    if not math.isfinite(raw):
+        return 0.25
+    # Light strike adjustment: the ATM closed-form overshoots for far-OTM
+    # calls and undershoots for puts. Heuristic clip catches the worst.
+    moneyness = K / S if S > 0 else 1.0
+    if moneyness > 1.5 or moneyness < 0.5:
+        raw = max(raw, 0.10)
+    return float(min(max(raw, IV_LOWER_BOUND), IV_UPPER_BOUND))
+
+
 def _newton_implied_vol(
     *,
     price: float,
@@ -115,14 +147,21 @@ def _newton_implied_vol(
     T: float,
     r: float,
     is_call: bool,
-    initial_sigma: float = 0.25,
+    initial_sigma: float | None = None,
 ) -> float | None:
     """Newton-Raphson IV fallback when brentq fails to bracket a root.
 
     Uses analytical vega as the derivative. Diverges quickly on bad
     starting points so we cap iterations and bail to ``None`` on overflow.
+    The initial guess defaults to the Brenner-Subrahmanyam closed form
+    (good for ATM, decent seed for non-ATM) when the caller does not
+    override.
     """
-    sigma = initial_sigma
+    sigma = (
+        initial_sigma
+        if initial_sigma is not None
+        else _brenner_subrahmanyam_seed(price=price, S=S, K=K, T=T)
+    )
     for _ in range(IV_NEWTON_MAX_ITER):
         try:
             f = _bs_price(S, K, T, r, sigma, is_call) - price
@@ -273,6 +312,12 @@ def fill_missing_iv(
     are missing/zero and a valid IV is available, so downstream GEX
     computation can run even when the upstream feed (e.g. OPRA Pillar) does
     not publish greeks.
+
+    This function is **CPU-bound** — on a fresh deployment with an empty
+    IV cache it loops scipy.optimize.brentq + Newton-Raphson over every
+    contract on the chain. Async callers should prefer
+    :func:`fill_missing_iv_async` to avoid blocking the event loop while
+    the pipeline warms up.
     """
     if df.empty:
         return df
@@ -338,6 +383,25 @@ def fill_missing_iv(
             df.loc[needs_greeks, "delta"]
         )
     return df
+
+
+async def fill_missing_iv_async(
+    df: pd.DataFrame,
+    *,
+    risk_free_rate: float,
+    today: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Async wrapper around :func:`fill_missing_iv`.
+
+    Runs the CPU-heavy IV inversion + Greeks fill on a worker thread via
+    :func:`asyncio.to_thread` so the event loop is free to service WS /
+    SSE traffic, ingestion writers, and other coroutines while the
+    pipeline warms its IV cache. On chains where the IV cache is already
+    populated this is essentially a no-op (the loop body never enters).
+    """
+    return await asyncio.to_thread(
+        fill_missing_iv, df, risk_free_rate=risk_free_rate, today=today
+    )
 
 
 def compute_iv_summary(df: pd.DataFrame) -> IVSummary:

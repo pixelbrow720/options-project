@@ -12,8 +12,12 @@ from typing_extensions import TypeVar
 # ── Auth ────────────────────────────────────────────────────────────────────
 
 class AdminLoginRequest(BaseModel):
-    username: str
-    password: str
+    # Cap field lengths so a malicious caller can't ship megabytes of JSON
+    # that we'd parse before bcrypt truncates the password to 72 bytes.
+    # The /admin/login route is rate-limited to 5/min/IP — combined with
+    # these caps the memory-DoS vector is closed.
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
 
 
 class AdminLoginResponse(BaseModel):

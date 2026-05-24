@@ -561,7 +561,7 @@ def test_sse_stream_revocation(monkeypatch) -> None:
 
     monkeypatch.setattr(stream_mod, "_authenticate_streaming_key", _fake_auth)
     monkeypatch.setattr(stream_mod, "build_snapshot_payload", _empty_payload)
-    
+
     # Speed up the heartbeat interval so we timeout and check revocation quickly
     monkeypatch.setattr(stream_mod, "HEARTBEAT_INTERVAL_SECONDS", 0.05)
 
@@ -571,17 +571,17 @@ def test_sse_stream_revocation(monkeypatch) -> None:
         # Use streaming get request to read SSE lines
         with client.stream("GET", "/v1/SPXW/stream/sse", headers={"X-API-Key": plaintext}) as resp:
             assert resp.status_code == 200
-            
+
             # Read the lines from the stream. It should terminate because _FakeSession.get
             # returns None, which triggers the revocation check to return True and break the loop.
             lines = list(resp.iter_lines())
-            
+
             # We expect to see the initial snapshot, and no more events because it terminates.
             assert len(lines) > 0
             initial_data = json.loads(lines[0].removeprefix("data: ").strip())
             assert initial_data["symbol"] == "SPXW"
             assert "gex" in initial_data["data"]
-        
+
     finally:
         client.close()
 

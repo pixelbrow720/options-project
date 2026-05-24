@@ -251,9 +251,12 @@ async def test_persist_metrics_commits_on_success() -> None:
     ts = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
     result = _minimal_pipeline_result("SPXW", ts)
 
-    inserted = await _persist_metrics(session, symbol="SPXW", ts=ts, result=result)
+    inserted, persisted = await _persist_metrics(
+        session, symbol="SPXW", ts=ts, result=result
+    )
 
     assert inserted > 0
+    assert persisted, "persisted metric_type set must be non-empty"
     assert session.commit_calls == 1
     assert session.rollback_calls == 0
     assert len(session.execute_calls) == 1
@@ -336,7 +339,9 @@ async def test_persist_metrics_empty_returns_zero_without_execute() -> None:
     # persisted as a NULL value row). So a non-zero count is fine — we
     # just want to confirm a single execute + commit cycle, not zero
     # writes. The "truly empty" branch is a no-op safety valve.
-    inserted = await _persist_metrics(session, symbol="SPXW", ts=ts, result=result)
+    inserted, _persisted = await _persist_metrics(
+        session, symbol="SPXW", ts=ts, result=result
+    )
     assert inserted >= 2  # the two GEX_NET_TOTAL rows
     assert session.commit_calls == 1
     assert session.rollback_calls == 0
@@ -440,17 +445,17 @@ def _patch_pipeline_persistence(
 
     monkeypatch.setattr(pipeline_mod, "resolve_spot", fake_resolve_spot)
 
-    def fake_fill_iv(df: pd.DataFrame, *, risk_free_rate: float) -> pd.DataFrame:
+    async def fake_fill_iv(df: pd.DataFrame, *, risk_free_rate: float) -> pd.DataFrame:
         return df
 
-    monkeypatch.setattr(pipeline_mod, "fill_missing_iv", fake_fill_iv)
+    monkeypatch.setattr(pipeline_mod, "fill_missing_iv_async", fake_fill_iv)
 
     async def fake_persist(
         session: object, *, symbol: str, ts: datetime, result: object
-    ) -> int:
+    ) -> tuple[int, set[str]]:
         if persist_raises:
             raise RuntimeError("persist boom")
-        return metric_rows_count
+        return metric_rows_count, set(persisted_metric_types or [])
 
     monkeypatch.setattr(pipeline_mod, "_persist_metrics", fake_persist)
 

@@ -74,11 +74,11 @@ def compute_pin_probability(
     else:
         today_d = today.date() if hasattr(today, "date") else today
 
-    # 0DTE-only filter.
+    # 0DTE-only filter — vectorised date comparison, ~100× faster than .apply.
     work = df.copy()
-    work["expiration_d"] = work["expiration"].apply(
-        lambda x: pd.Timestamp(x).date() if pd.notna(x) else None
-    )
+    work["expiration_d"] = pd.to_datetime(
+        work["expiration"], errors="coerce"
+    ).dt.date
     work = work[work["expiration_d"] == today_d]
     if work.empty:
         return []

@@ -6,19 +6,25 @@ crypto — we wrap :class:`cryptography.fernet.Fernet`, which is the
 audited AES-128-CBC + HMAC-SHA-256 scheme from the ``cryptography``
 library.
 
-The Fernet key itself is derived deterministically from the application
-``JWT_SECRET`` so we don't introduce a second piece of operator-managed
-secret material. The derivation uses HKDF-SHA-256 with a fixed
+The Fernet key itself is derived deterministically from the operator-
+managed ``DB_ENCRYPTION_KEY`` env var so we don't have to ship the raw
+Fernet key around. The derivation uses HKDF-SHA-256 with a fixed
 application-specific salt and ``info`` label so:
 
-* knowing ``JWT_SECRET`` always reproduces the same Fernet key (so the
-  encrypted blobs in the DB stay readable after a restart), and
-* the derived key is not the same as ``JWT_SECRET`` itself — leaking
-  the encryption key does *not* leak the JWT signing key.
+* knowing ``DB_ENCRYPTION_KEY`` always reproduces the same Fernet key
+  (so the encrypted blobs in the DB stay readable after a restart), and
+* the derived key is not the same as the input — leaking the encryption
+  key does *not* leak the input secret directly.
+
+**Why a separate secret?** Older deployments derived the Fernet key from
+``JWT_SECRET``; rotating that secret invalidated every encrypted blob in
+the DB. ``DB_ENCRYPTION_KEY`` is now read first, with a ``JWT_SECRET``
+fallback so existing deployments keep working until operators run a
+re-encryption job and switch over.
 
 **Rotation note.** Today there is exactly one active derivation. If we
-ever rotate ``JWT_SECRET`` we'll need a re-encryption job: read each
-encrypted blob with the old derived key, write it back with the new
+ever rotate ``DB_ENCRYPTION_KEY`` we'll need a re-encryption job: read
+each encrypted blob with the old derived key, write it back with the new
 one. There's no in-place support for that yet — opening the door now
 would be premature.
 """
@@ -41,8 +47,8 @@ _HKDF_SALT = b"pantek-waang.crypto.v1"
 _HKDF_INFO = b"databento-api-key-encryption"
 
 
-def _derive_fernet_key(jwt_secret: str) -> bytes:
-    """Deterministically derive a 32-byte Fernet key from ``jwt_secret``.
+def _derive_fernet_key(input_secret: str) -> bytes:
+    """Deterministically derive a 32-byte Fernet key from ``input_secret``.
 
     Returns a URL-safe base64 encoded 32-byte key, which is what
     :class:`Fernet` expects.
@@ -53,18 +59,30 @@ def _derive_fernet_key(jwt_secret: str) -> bytes:
         salt=_HKDF_SALT,
         info=_HKDF_INFO,
     )
-    raw = hkdf.derive(jwt_secret.encode("utf-8"))
+    raw = hkdf.derive(input_secret.encode("utf-8"))
     return base64.urlsafe_b64encode(raw)
 
 
 @lru_cache(maxsize=1)
 def _get_fernet() -> Fernet:
-    """Cached Fernet instance derived from current settings."""
+    """Cached Fernet instance derived from current settings.
+
+    Resolution order:
+      1. ``DB_ENCRYPTION_KEY`` — operator-managed at-rest secret. Preferred
+         on new deployments because rotating ``JWT_SECRET`` no longer
+         invalidates the encrypted Databento key pool.
+      2. ``JWT_SECRET`` — legacy fallback. Existing deployments that
+         pre-date the split keep working until ``DB_ENCRYPTION_KEY`` is
+         set and the encrypted rows are re-keyed.
+    """
     settings = get_settings()
-    secret = (settings.jwt_secret or "").strip()
+    secret = (settings.db_encryption_key or "").strip()
+    if not secret:
+        secret = (settings.jwt_secret or "").strip()
     if not secret:
         raise RuntimeError(
-            "JWT_SECRET must be set to use the encrypted key pool"
+            "DB_ENCRYPTION_KEY (or JWT_SECRET fallback) must be set "
+            "to use the encrypted key pool"
         )
     return Fernet(_derive_fernet_key(secret))
 

@@ -90,32 +90,41 @@ def classify_lee_ready(
     quote_classified_mask = side != 0
 
     # ── Tick rule fallback ───────────────────────────────────────────────
-    # Walk through unclassified trades and look back to the most recent
-    # **different** trade price. Equal-to-previous (zero-tick) trades
-    # remain unclassified.
+    # Vectorised, with canonical Lee & Ready (1991) semantics: each
+    # unclassified row is compared against the most recent **different**
+    # trade price. We build that reference column once over the whole
+    # series (no Python loop) and then turn the price-vs-reference sign
+    # into the tick-rule side.
+    #
+    # The reference column is "the price that was current the last time
+    # the price changed, observed strictly before this row":
+    #   * row 0 → NaN  (no history)
+    #   * any row whose price equals its predecessor → inherits the prev
+    #     row's reference (so a zero-tick run keeps comparing against the
+    #     same anchor)
+    #   * any row whose price differs from its predecessor → the
+    #     predecessor's price becomes the reference for the *next* row
+    #
+    # Concretely: mask out duplicate prices, ffill the rest, then shift(1)
+    # so the reference for row i is the latest distinct price observed
+    # before row i. Non-finite prices remain unclassified.
     tick_classified_mask = np.zeros_like(price, dtype=bool)
     if (side == 0).any():
-        last_diff_price = np.nan
-        for i in range(price.size):
-            if side[i] != 0:
-                if np.isfinite(price[i]):
-                    last_diff_price = price[i]
-                continue
-            if not np.isfinite(price[i]):
-                # cannot apply tick rule to a non-finite price
-                continue
-            if np.isfinite(last_diff_price):
-                if price[i] > last_diff_price:
-                    side[i] = 1
-                    tick_classified_mask[i] = True
-                elif price[i] < last_diff_price:
-                    side[i] = -1
-                    tick_classified_mask[i] = True
-                # equal → leave as 0 (zero-tick); do not update history.
-            if np.isfinite(last_diff_price) and price[i] != last_diff_price:
-                last_diff_price = price[i]
-            elif not np.isfinite(last_diff_price):
-                last_diff_price = price[i]
+        prices_s = pd.Series(price)
+        not_dup = prices_s.diff().ne(0)  # NaN → True (treats row 0 as a new price)
+        last_diff_price = (
+            prices_s.where(not_dup).ffill().shift(1).to_numpy(dtype=float)
+        )
+        finite_price = np.isfinite(price)
+        finite_ref = np.isfinite(last_diff_price)
+        delta = np.where(finite_price & finite_ref, price - last_diff_price, np.nan)
+        tick_side = np.where(
+            np.isfinite(delta) & (delta > 0), 1,
+            np.where(np.isfinite(delta) & (delta < 0), -1, 0),
+        ).astype(np.int8)
+        final_side = np.where(side != 0, side, tick_side).astype(np.int8)
+        tick_classified_mask = (side == 0) & (final_side != 0)
+        side = final_side
 
     work["mid"] = mid
     work["side"] = side

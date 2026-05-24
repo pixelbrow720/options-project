@@ -6,8 +6,9 @@ positioning. Sudden basis dislocations often precede broader risk events.
 
 This module is a simple stateless transformer: pass the latest spot
 indication (e.g. SPX cash quote) and the futures last price, get back
-``basis = futures - spot`` plus a few derived numbers we cache for the
-website.
+``basis = spot - futures`` plus a few derived numbers we cache for the
+website. The sign convention matches :mod:`app.processing.spot` so that
+``cash ≈ futures + basis`` holds end-to-end.
 """
 
 from __future__ import annotations

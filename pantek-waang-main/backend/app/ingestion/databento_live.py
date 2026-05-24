@@ -487,6 +487,12 @@ class DatabentoLiveIngester:
         end = datetime.now(UTC) - timedelta(minutes=30)
         start = end - timedelta(days=2)
         loaded = 0
+        # Build a fresh registry rather than merging into the existing dict
+        # so contracts that have rolled off the live definition feed (i.e.
+        # already expired) age out instead of accumulating across long-
+        # running deployments. Live ``Definition`` records that arrive
+        # after this rebuild keep being merged via ``_handle_definition``.
+        new_registry: dict[int, dict[str, Any]] = {}
         for underlying in self._settings.supported_symbols:
             parent = f"{underlying.upper()}{PARENT_SUFFIX}"
             try:
@@ -533,13 +539,23 @@ class DatabentoLiveIngester:
                     continue
                 if expiry_d is None:
                     continue
-                self._registry[instrument_id] = {
+                new_registry[instrument_id] = {
                     "symbol": underlying.upper(),
                     "expiration": expiry_d,
                     "strike": strike,
                     "option_type": opt_char,
                 }
                 loaded += 1
+        # Atomically swap so concurrent reads never see a half-built map.
+        if new_registry:
+            self._registry = new_registry
+            # Garbage-collect _state entries for instruments that no longer
+            # exist in the registry. Without this, _state grows unbounded
+            # over long-running deployments as expired weekly contracts
+            # accumulate.
+            for stale_id in list(self._state.keys()):
+                if stale_id not in self._registry:
+                    self._state.pop(stale_id, None)
         logger.info("live_registry_bootstrapped", contracts=loaded)
 
     def _drop_unsupported_schema(self, error_message: str) -> str | None:

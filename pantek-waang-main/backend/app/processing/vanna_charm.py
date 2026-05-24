@@ -25,8 +25,17 @@ import numpy as np
 import pandas as pd
 
 from app.processing import bsm
+from app.processing.session import calendar_tau_years
 
 CONTRACT_MULTIPLIER = 100
+
+# Minimum tau (in years) used to floor Greeks against blow-ups in the
+# final minutes before expiry. 15 minutes ≈ 2.85e-5 years. Below this,
+# d1 / d2 send norm.pdf to ~0 while the 1/(σ√τ) term explodes, producing
+# numerically unstable per-strike values that swamp the dealer-exposure
+# aggregate. Floor kept conservative — 15 min is the smallest interval
+# day-traders care about (the next pipeline tick is ~60s away anyway).
+TAU_FLOOR_YEARS: float = 15.0 / (365.0 * 24.0 * 60.0)
 
 
 @dataclass
@@ -85,16 +94,7 @@ def _prepare(
     work.loc[~np.isfinite(work["weight"]), "weight"] = 0.0
     work["iv"] = pd.to_numeric(work["iv"], errors="coerce")
     work["strike"] = pd.to_numeric(work["strike"], errors="coerce")
-
-    def _tau(exp) -> float:  # type: ignore[no-untyped-def]
-        try:
-            d = pd.Timestamp(exp).date()
-            # 0DTE -> 1/365 (one day floor) so charm/vanna don't blow up.
-            return max(1, (d - today_d).days) / 365.0
-        except (TypeError, ValueError):
-            return 0.0
-
-    work["tau"] = work["expiration"].apply(_tau)
+    work["tau"] = calendar_tau_years(work["expiration"], today=today_d)
     work = work[
         (work["weight"].abs() > 0)
         & np.isfinite(work["weight"])
@@ -172,15 +172,29 @@ def compute_vanna(
     risk_free_rate: float = 0.05,
     today: pd.Timestamp | None = None,
     top_n: int = 5,
+    tau_years: float | None = None,
 ) -> GreekSummary:
-    """Aggregate dealer **Vanna** exposure curve, in dollars per +1 vol point."""
+    """Aggregate dealer **Vanna** exposure curve, in dollars per +1 vol point.
+
+    ``tau_years`` mirrors :func:`compute_charm` — when provided, every
+    row's calendar-day τ is overridden with that value (e.g. the
+    session-aware 0DTE τ from
+    :func:`app.processing.session.time_to_expiry_0dte_years`). All τ
+    inputs are floored at :data:`TAU_FLOOR_YEARS` (15 minutes) so the
+    BSM Greeks stay numerically stable in the last few minutes before
+    expiry.
+    """
     work, S = _prepare(df, weight_col=weight_col, today=today)
     if work is None:
         return _empty(weight_col)
 
     K = work["strike"].to_numpy(dtype=float)
     sigma = work["iv"].to_numpy(dtype=float)
-    tau = work["tau"].to_numpy(dtype=float)
+    if tau_years is not None and np.isfinite(tau_years) and tau_years > 0:
+        tau = np.full(len(work), float(tau_years), dtype=float)
+    else:
+        tau = work["tau"].to_numpy(dtype=float)
+    tau = np.maximum(tau, TAU_FLOOR_YEARS)
     weight = work["weight"].to_numpy(dtype=float)
 
     # Per-option vanna (∂Δ/∂σ). Convert to per-1-vol-point by ×0.01.
@@ -213,6 +227,9 @@ def compute_charm(
     per-strike CHARM_0DTE_LEVEL rows match the scalar
     CHARM_0DTE_DECAY_RATE. ``None`` keeps the calendar-day floor used by
     the multi-expiry default path.
+
+    All τ inputs are floored at :data:`TAU_FLOOR_YEARS` (15 minutes) to
+    keep Greeks stable as expiry approaches.
     """
     work, S = _prepare(df, weight_col=weight_col, today=today)
     if work is None:
@@ -224,6 +241,7 @@ def compute_charm(
         tau = np.full(len(work), float(tau_years), dtype=float)
     else:
         tau = work["tau"].to_numpy(dtype=float)
+    tau = np.maximum(tau, TAU_FLOOR_YEARS)
     weight = work["weight"].to_numpy(dtype=float)
     is_call = work["option_type"].astype(str).str.upper().to_numpy() == "C"
 

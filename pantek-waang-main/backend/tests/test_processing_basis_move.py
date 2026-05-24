@@ -10,9 +10,11 @@ from app.processing.move_tracker import compute_move_tracker
 
 def test_basis_simple():
     out = compute_basis(spot=5800.0, futures=5810.0)
-    assert out.basis == 10.0
+    # Convention: basis = spot - futures (so cash ≈ futures + basis).
+    # Front-month ES typically trades over cash → negative basis.
+    assert out.basis == -10.0
     assert out.basis_pct is not None
-    assert abs(out.basis_pct - 10.0 / 5800.0) < 1e-9
+    assert abs(out.basis_pct - (-10.0 / 5800.0)) < 1e-9
 
 
 def test_basis_handles_missing_inputs():

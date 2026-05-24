@@ -39,6 +39,8 @@ import numpy as np
 import pandas as pd
 from scipy.stats import norm
 
+from app.processing.session import calendar_tau_years
+
 
 def compute_zero_gamma(
     df: pd.DataFrame,
@@ -85,14 +87,7 @@ def compute_zero_gamma(
     work["iv"] = pd.to_numeric(work["iv"], errors="coerce")
     work["strike"] = pd.to_numeric(work["strike"], errors="coerce")
 
-    def _tau(exp) -> float:  # type: ignore[no-untyped-def]
-        try:
-            d = pd.Timestamp(exp).date()
-            return max(1, (d - today_d).days) / 365.0
-        except (TypeError, ValueError):
-            return 0.0
-
-    work["tau"] = work["expiration"].apply(_tau)
+    work["tau"] = calendar_tau_years(work["expiration"], today=today_d)
     work = work[
         (work["weight"].abs() > 0)
         & np.isfinite(work["weight"])

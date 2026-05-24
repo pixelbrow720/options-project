@@ -44,7 +44,7 @@ from app.ingestion.key_pool import (
     record_key_error,
     record_key_success,
 )
-from app.processing.spot import _basis_cache
+from app.processing.spot import get_basis
 
 # Map a futures parent root (the alpha prefix of e.g. ``ESM6``) to the cash
 # index symbol our public API uses. Anything not in this map is silently
@@ -678,10 +678,7 @@ class GlobexLiveIngester:
         )
         if cash_symbol is not None:
             try:
-                basis_entry = _basis_cache.get(cash_symbol)
-                basis_value: float | None = (
-                    float(basis_entry.value) if basis_entry is not None else None
-                )
+                basis_value: float | None = get_basis(cash_symbol)
                 cash_spot: float | None = (
                     float(price) + basis_value if basis_value is not None else None
                 )

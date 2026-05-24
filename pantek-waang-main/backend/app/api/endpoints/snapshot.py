@@ -15,11 +15,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Request
-from sqlalchemy import func, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import limiter, require_symbol_access
 from app.api.endpoints.data import _latest_metrics, _latest_metrics_batch, _walls_payload
+from app.api.endpoints.flow import _serialise_event
 from app.api.schemas import DataEnvelope
 from app.config import get_settings
 from app.db.models import FlowEvent
@@ -31,6 +32,53 @@ router = APIRouter()
 
 
 _SYMBOL_PATTERN = r"^[A-Z][A-Z0-9]{0,11}$"
+
+
+# ── In-process snapshot prime cache ──────────────────────────────────────────
+# A reconnect storm (deploy, network blip) can trigger N×26 metric_type
+# queries when N WS clients all prime concurrently. We keep the most-recent
+# ``(payload, computed_at)`` per symbol with a short TTL so successive primes
+# share the same DB read. The pipeline writes through on every successful
+# publish via :func:`set_cached_snapshot`, so the cache is generally warm
+# for ``COMPUTE_INTERVAL_SECONDS`` after each tick — well past the typical
+# reconnect window.
+_SNAPSHOT_CACHE_TTL_SECONDS: float = 10.0
+_snapshot_cache: dict[
+    str, tuple[float, dict[str, Any], datetime | None]
+] = {}
+
+
+def get_cached_snapshot(
+    symbol: str,
+) -> tuple[dict[str, Any], datetime | None] | None:
+    """Return ``(payload, computed_at)`` for ``symbol`` if fresh, else ``None``."""
+    sym_u = symbol.upper()
+    entry = _snapshot_cache.get(sym_u)
+    if entry is None:
+        return None
+    cached_at, payload, computed_at = entry
+    from time import monotonic
+
+    if monotonic() - cached_at > _SNAPSHOT_CACHE_TTL_SECONDS:
+        _snapshot_cache.pop(sym_u, None)
+        return None
+    return payload, computed_at
+
+
+def set_cached_snapshot(
+    symbol: str,
+    payload: dict[str, Any],
+    computed_at: datetime | None,
+) -> None:
+    """Write a fresh snapshot into the prime cache."""
+    from time import monotonic
+
+    _snapshot_cache[symbol.upper()] = (monotonic(), payload, computed_at)
+
+
+def reset_snapshot_cache_for_tests() -> None:
+    """Test helper: clear the cache so tests start with a cold prime."""
+    _snapshot_cache.clear()
 
 
 async def build_snapshot_payload(session: AsyncSession, symbol: str) -> tuple[dict[str, Any], datetime | None]:
@@ -233,18 +281,33 @@ async def build_snapshot_payload(session: AsyncSession, symbol: str) -> tuple[di
         key=lambda x: x.get("expiration", ""),
     )
 
-    # HIRO — cumulative signed premium of the most-recent bucket.
-    hiro_rows = await _latest_metrics(session, sym, "HIRO")
+    # HIRO — cumulative + full series for the latest bucket window. The
+    # snapshot exposes both shapes:
+    #   * ``hiro_cumulative`` (legacy scalar — pre-Rev 6 consumers)
+    #   * ``hiro`` (Rev 6 — full payload mirroring /v1/{symbol}/hiro so
+    #     a frontend that primes from /snapshot can render the chart
+    #     immediately without a second roundtrip)
+    hiro_rows = metrics["HIRO"]
     hiro_cumulative = float(hiro_rows[0].value or 0.0) if hiro_rows else 0.0
+    if hiro_rows:
+        _hiro_extra = dict(hiro_rows[0].extra_json or {})
+        hiro_payload: dict[str, Any] | None = {
+            "bucket_size": _hiro_extra.get("bucket_size", "1min"),
+            "cumulative": float(_hiro_extra.get("cumulative") or hiro_cumulative),
+            "series": list(_hiro_extra.get("series") or []),
+            "weight_source": _hiro_extra.get("weight_source", "signed_premium"),
+        }
+    else:
+        hiro_payload = None
 
-    # Rev 4 — 0DTE/back-month cohort splits.
-    gex_0dte_oi_rows = await _latest_metrics(session, sym, "GEX_0DTE_NET_TOTAL")
-    gex_0dte_vol_rows = await _latest_metrics(session, sym, "GEX_0DTE_NET_TOTAL_VOL")
-    gex_back_oi_rows = await _latest_metrics(session, sym, "GEX_BACK_NET_TOTAL")
-    gex_back_vol_rows = await _latest_metrics(session, sym, "GEX_BACK_NET_TOTAL_VOL")
-    charm_0dte_rows = await _latest_metrics(session, sym, "CHARM_0DTE_NET_TOTAL")
-    charm_decay_rows = await _latest_metrics(session, sym, "CHARM_0DTE_DECAY_RATE")
-    flip_rows = await _latest_metrics(session, sym, "GEX_0DTE_FLIP_SPEED")
+    # Rev 4 — 0DTE/back-month cohort splits. All already in the batch above.
+    gex_0dte_oi_rows = metrics["GEX_0DTE_NET_TOTAL"]
+    gex_0dte_vol_rows = metrics["GEX_0DTE_NET_TOTAL_VOL"]
+    gex_back_oi_rows = metrics["GEX_BACK_NET_TOTAL"]
+    gex_back_vol_rows = metrics["GEX_BACK_NET_TOTAL_VOL"]
+    charm_0dte_rows = metrics["CHARM_0DTE_NET_TOTAL"]
+    charm_decay_rows = metrics["CHARM_0DTE_DECAY_RATE"]
+    flip_rows = metrics["GEX_0DTE_FLIP_SPEED"]
 
     def _gex_summary(rows: list) -> dict[str, Any]:
         if not rows:
@@ -279,19 +342,31 @@ async def build_snapshot_payload(session: AsyncSession, symbol: str) -> tuple[di
     session_state = session_snapshot(symbol=sym)
 
     # Rev 4 — spot resolution block (futures_basis | parity | stale_cache).
-    spot_rows = await _latest_metrics(session, sym, "SPOT")
+    spot_rows = metrics["SPOT"]
     spot_payload: dict[str, Any] | None = None
     if spot_rows:
         r = spot_rows[0]
         spot_payload = dict(r.extra_json or {})
         spot_payload.setdefault("price", float(r.value or 0.0))
 
-    # Flow events in the last hour (count only — series lives at /flow).
+    # Flow events in the last hour (count + the most recent 50 for the
+    # snapshot tail). Series remains the dedicated /flow endpoint — this
+    # tail is a convenience for clients that want a live ticker without a
+    # second roundtrip.
     since = datetime.now(UTC) - timedelta(hours=1)
     flow_count_q = select(func.count(FlowEvent.id)).where(
         FlowEvent.symbol == sym, FlowEvent.ts >= since
     )
     flow_events_last_hour = int((await session.execute(flow_count_q)).scalar_one() or 0)
+
+    flow_tail_stmt = (
+        select(FlowEvent)
+        .where(FlowEvent.symbol == sym, FlowEvent.ts >= since)
+        .order_by(desc(FlowEvent.ts))
+        .limit(50)
+    )
+    flow_tail_rows = (await session.execute(flow_tail_stmt)).scalars().all()
+    flow_tail = [_serialise_event(r) for r in flow_tail_rows]
 
     payload = {
         "gex": gex_payload,
@@ -315,7 +390,9 @@ async def build_snapshot_payload(session: AsyncSession, symbol: str) -> tuple[di
         "risk_reversal_25d": risk_reversal_25d,
         "iv_term_structure": iv_term_structure,
         "hiro_cumulative": hiro_cumulative,
+        "hiro": hiro_payload,
         "flow_events_last_hour": flow_events_last_hour,
+        "flow": flow_tail,
         # Rev 4 additions.
         "session_state": session_state,
         "spot": spot_payload,

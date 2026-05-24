@@ -18,6 +18,7 @@ of futures ticks from ``futures_ticks``, then:
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import pandas as pd
@@ -37,13 +38,36 @@ from app.db.session import get_session_factory
 from app.ingestion.bulk_writers import get_flow_event_writer
 from app.processing.basis import compute_basis
 from app.processing.flow_events import FlowEventConfig, detect_flow_events
-from app.processing.hiro import compute_hiro
+from app.processing.hiro import compute_hiro, compute_hiro_incremental
 from app.processing.volume_profile import compute_volume_profile
 
 logger = get_logger(__name__)
 
 
 SENTINEL_EXPIRY = pd.Timestamp("1970-01-01").date()
+
+
+# ── Incremental HIRO state ──────────────────────────────────────────────────
+# Per-symbol cache of (last_series, last_query_end_ts). Re-aggregating the
+# full 60-min trade window every tick was the second-hottest CPU path; this
+# state lets us only re-bucketise new trades and prune expired buckets.
+@dataclass
+class _HiroCacheEntry:
+    series: list[dict]
+    last_query_end: datetime
+    bucket_size: str
+    window_minutes: int
+
+
+_hiro_state: dict[str, _HiroCacheEntry] = {}
+
+
+def reset_hiro_state(symbol: str | None = None) -> None:
+    """Clear the incremental-HIRO cache (test helper / session-open reset)."""
+    if symbol is None:
+        _hiro_state.clear()
+    else:
+        _hiro_state.pop(symbol.upper(), None)
 
 
 async def run_flow_pipeline(
@@ -62,9 +86,30 @@ async def run_flow_pipeline(
     now = datetime.now(UTC)
     window_start = now - timedelta(minutes=window_minutes)
 
+    sym_u = symbol.upper()
+    cache_entry = _hiro_state.get(sym_u)
+    cache_compatible = (
+        cache_entry is not None
+        and cache_entry.bucket_size == hiro_bucket
+        and cache_entry.window_minutes == window_minutes
+        and cache_entry.last_query_end <= now
+    )
+    # Pull only the *new* trade window when we have a warm cache, otherwise
+    # the legacy 60-minute pull. Buckets older than ``window_minutes`` are
+    # pruned during the merge inside :func:`compute_hiro_incremental`.
+    if cache_compatible:
+        # Add a small safety overlap so a trade at the bucket boundary
+        # doesn't slip between two queries.
+        trade_query_start = max(
+            window_start, cache_entry.last_query_end - timedelta(seconds=5)
+        )
+    else:
+        trade_query_start = window_start
+
     async with factory() as session:
-        opt_trades = await _load_options_trades(session, symbol=symbol,
-                                                start=window_start, end=now)
+        opt_trades = await _load_options_trades(
+            session, symbol=symbol, start=trade_query_start, end=now
+        )
         fut_trades, fut_last = await _load_futures_trades(session,
                                                           symbols=futures_symbols,
                                                           start=window_start,
@@ -72,6 +117,9 @@ async def run_flow_pipeline(
         chain_underlying = await _load_chain_underlying(session, symbol=symbol)
         contract_adv = await _load_contract_adv(session, symbol=symbol)
         contract_oi = await _load_contract_oi(session, symbol=symbol)
+        # Delta lookup: latest BSM/feed delta per (expiration, strike,
+        # option_type) — feeds the HIRO delta-notional path.
+        contract_delta = await _load_contract_delta(session, symbol=symbol)
 
     # ── Flow events ──────────────────────────────────────────────────────
     cfg = FlowEventConfig.from_settings(get_settings())
@@ -103,7 +151,33 @@ async def run_flow_pipeline(
         await writer.add_many(rows)
 
     # ── HIRO ─────────────────────────────────────────────────────────────
-    hiro = compute_hiro(opt_trades, bucket=hiro_bucket)
+    # Annotate trades with the latest delta lookup so the canonical
+    # delta-notional path can run. Trades without a delta join fall back
+    # to signed-premium inside ``compute_hiro``.
+    if not opt_trades.empty and contract_delta is not None and not contract_delta.empty:
+        opt_trades = opt_trades.merge(
+            contract_delta,
+            on=["expiration", "strike", "option_type"],
+            how="left",
+        )
+    if cache_compatible:
+        hiro = compute_hiro_incremental(
+            opt_trades,
+            bucket=hiro_bucket,
+            window_minutes=window_minutes,
+            prev_series=cache_entry.series,
+            now=now,
+        )
+    else:
+        hiro = compute_hiro(opt_trades, bucket=hiro_bucket)
+
+    # Update cache for next tick.
+    _hiro_state[sym_u] = _HiroCacheEntry(
+        series=hiro.series,
+        last_query_end=now,
+        bucket_size=hiro_bucket,
+        window_minutes=window_minutes,
+    )
 
     # ── Basis ────────────────────────────────────────────────────────────
     es_last = fut_last.get("ES") if fut_last else None
@@ -131,6 +205,7 @@ async def run_flow_pipeline(
                     "bucket_size": hiro.bucket_size,
                     "series": hiro.series,
                     "cumulative": hiro.cumulative,
+                    "weight_source": hiro.weight_source,
                 },
             }
         )
@@ -294,7 +369,19 @@ async def _load_contract_oi(session, *, symbol: str) -> pd.DataFrame | None:
 
     Used as a secondary UOA fallback when no trailing-ADV row exists for
     a contract.
+
+    Bounded to the configured loader window (default 6h) — without that
+    bound this scanned the entire ``options_chain`` hypertable on every
+    flow tick, which the ``DISTINCT ON`` loader avoids.
     """
+    from datetime import UTC, datetime, timedelta
+
+    from app.config import get_settings as _get_settings_local
+
+    settings = _get_settings_local()
+    cutoff = datetime.now(UTC) - timedelta(
+        hours=int(settings.loader_snapshot_window_hours)
+    )
     stmt = (
         select(
             OptionsChain.symbol,
@@ -305,6 +392,7 @@ async def _load_contract_oi(session, *, symbol: str) -> pd.DataFrame | None:
         )
         .where(OptionsChain.symbol == symbol)
         .where(OptionsChain.oi.is_not(None))
+        .where(OptionsChain.ts >= cutoff)
         .order_by(OptionsChain.ts.desc())
     )
     res = await session.execute(stmt)
@@ -334,3 +422,42 @@ async def _load_chain_underlying(session, *, symbol: str) -> float | None:
     if row is None or row[0] is None:
         return None
     return float(row[0])
+
+
+async def _load_contract_delta(
+    session, *, symbol: str
+) -> pd.DataFrame | None:
+    """Latest non-null ``delta`` per contract for the symbol.
+
+    Used by the HIRO delta-notional path. Bounded by the same loader
+    window as :func:`_load_contract_oi` so we don't full-scan the
+    hypertable. Returns ``None`` when no rows are available — callers
+    must fall back to signed-premium.
+    """
+    settings = get_settings()
+    cutoff = datetime.now(UTC) - timedelta(
+        hours=int(settings.loader_snapshot_window_hours)
+    )
+    stmt = (
+        select(
+            OptionsChain.expiration,
+            OptionsChain.strike,
+            OptionsChain.option_type,
+            OptionsChain.delta,
+        )
+        .where(OptionsChain.symbol == symbol)
+        .where(OptionsChain.delta.is_not(None))
+        .where(OptionsChain.ts >= cutoff)
+        .order_by(OptionsChain.ts.desc())
+    )
+    res = await session.execute(stmt)
+    rows = res.mappings().all()
+    if not rows:
+        return None
+    df = pd.DataFrame([dict(r) for r in rows])
+    df = df.drop_duplicates(
+        subset=["expiration", "strike", "option_type"], keep="first"
+    )
+    df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+    df["delta"] = pd.to_numeric(df["delta"], errors="coerce")
+    return df

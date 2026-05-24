@@ -38,11 +38,16 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.endpoints.snapshot import build_snapshot_payload
+from app.api.endpoints.snapshot import (
+    build_snapshot_payload,
+    get_cached_snapshot,
+    set_cached_snapshot,
+)
 from app.api.stream_notifier import get_stream_notifier
+from app.api.tick_notifier import get_tick_notifier
 from app.config import get_settings
 from app.core.logging import get_logger
-from app.core.security import verify_api_key
+from app.core.security import api_key_lookup_digest, verify_api_key
 from app.db.models import ApiKey
 from app.db.session import get_session_factory
 
@@ -124,15 +129,34 @@ async def _authenticate_streaming_key(
     """
     if not api_key:
         return None
-    prefix = api_key[:11]
-    rows = (
-        await session.execute(select(ApiKey).where(ApiKey.key_prefix == prefix))
-    ).scalars().all()
+    # Mirror the REST auth fast path: O(1) keyed-BLAKE2b lookup with a
+    # lazy prefix-scan fallback for legacy rows whose ``key_lookup`` is
+    # still NULL (pre-migration-0010).
     matched: ApiKey | None = None
-    for candidate in rows:
-        if verify_api_key(api_key, candidate.key_hash):
-            matched = candidate
-            break
+    lookup_digest = api_key_lookup_digest(api_key)
+    fast = await session.execute(
+        select(ApiKey).where(ApiKey.key_lookup == lookup_digest)
+    )
+    candidate = fast.scalar_one_or_none()
+    if candidate is not None and verify_api_key(api_key, candidate.key_hash):
+        matched = candidate
+
+    if matched is None:
+        prefix = api_key[:11]
+        rows = (
+            await session.execute(
+                select(ApiKey).where(
+                    ApiKey.key_prefix == prefix,
+                    ApiKey.key_lookup.is_(None),
+                )
+            )
+        ).scalars().all()
+        for row in rows:
+            if verify_api_key(api_key, row.key_hash):
+                matched = row
+                row.key_lookup = lookup_digest
+                await session.commit()
+                break
     if matched is None or not matched.is_active:
         return None
     if matched.expires_at is not None:
@@ -244,10 +268,20 @@ async def stream_ws(
         await websocket.send_text(json.dumps(payload, default=str))
 
     # Prime the connection with the latest snapshot so subscribers don't have
-    # to wait a full pipeline cycle to see data.
+    # to wait a full pipeline cycle to see data. Reuse the in-process cache
+    # populated by the pipeline on every successful tick — a reconnect
+    # storm would otherwise hammer the DB with one set of ~26 metric_type
+    # queries per connecting client.
+    cached = get_cached_snapshot(sym_u)
     try:
-        async with factory() as session:
-            initial_payload, computed_at = await build_snapshot_payload(session, sym_u)
+        if cached is not None:
+            initial_payload, computed_at = cached
+        else:
+            async with factory() as session:
+                initial_payload, computed_at = await build_snapshot_payload(
+                    session, sym_u
+                )
+            set_cached_snapshot(sym_u, initial_payload, computed_at)
         await _send_json(_frame(sym_u, computed_at, initial_payload))
     except Exception:  # noqa: BLE001 - best-effort prime
         logger.exception("stream_ws_initial_snapshot_failed", symbol=sym_u)
@@ -283,24 +317,38 @@ async def stream_ws(
     async def _pump() -> None:
         try:
             while True:
-                try:
-                    payload = await asyncio.wait_for(
-                        queue.get(), timeout=REVOCATION_CHECK_INTERVAL_SECONDS
-                    )
-                except TimeoutError:
-                    if await _is_revoked():
-                        try:
-                            await websocket.close(code=WS_REVOKED_CODE)
-                        except (RuntimeError, ConnectionError):
-                            pass
-                        return
-                    continue
+                payload = await queue.get()
                 await _send_json(_published_frame(sym_u, payload))
         except (WebSocketDisconnect, RuntimeError, ConnectionError):
             return
 
+    async def _revocation_watcher() -> None:
+        """Independently poll the API key state and close the WS if revoked.
+
+        Must run as a separate task: polling inside ``_pump`` only fires on
+        the queue-timeout branch, which never triggers when the pipeline
+        is publishing regularly. A revoked key would otherwise keep
+        streaming until the client disconnects.
+        """
+        try:
+            while True:
+                await asyncio.sleep(REVOCATION_CHECK_INTERVAL_SECONDS)
+                if await _is_revoked():
+                    try:
+                        await websocket.close(code=WS_REVOKED_CODE)
+                    except (RuntimeError, ConnectionError):
+                        pass
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("stream_ws_revocation_watcher_error", symbol=sym_u)
+
     pump_task = asyncio.create_task(_pump(), name=f"ws_pump:{sym_u}")
     heartbeat_task = asyncio.create_task(_heartbeat(), name=f"ws_hb:{sym_u}")
+    revoke_task = asyncio.create_task(
+        _revocation_watcher(), name=f"ws_revoke:{sym_u}"
+    )
 
     try:
         while True:
@@ -312,9 +360,9 @@ async def stream_ws(
     except Exception:  # noqa: BLE001
         logger.exception("stream_ws_error", symbol=sym_u)
     finally:
-        for t in (pump_task, heartbeat_task):
+        for t in (pump_task, heartbeat_task, revoke_task):
             t.cancel()
-        for t in (pump_task, heartbeat_task):
+        for t in (pump_task, heartbeat_task, revoke_task):
             try:
                 await t
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
@@ -324,6 +372,137 @@ async def stream_ws(
 
 
 # ── Server-Sent Events fallback ─────────────────────────────────────────────
+
+
+@router.websocket("/v1/{symbol}/stream/ticks")
+async def stream_ticks_ws(
+    websocket: WebSocket,
+    symbol: str = Path(..., min_length=1, max_length=20, pattern=_SYMBOL_PATTERN),
+    key: str | None = Query(default=None),
+) -> None:
+    """Push raw spot/futures ticks for ``symbol`` as the GLBX feed prints.
+
+    Channel is high-frequency (each ES/NQ trade fans out a frame) — the
+    underlying :class:`TickNotifier` is sized for hundreds of ticks/sec and
+    drops oldest-on-overflow. Clients must consume promptly; slow consumers
+    will lose ticks rather than block the publisher.
+
+    Auth + per-key cap mirror the snapshot stream.
+    """
+    sym_u = symbol.upper()
+    factory = get_session_factory()
+
+    api_key_value = websocket.headers.get("x-api-key") or key
+    async with factory() as session:
+        api_key_row = await _authenticate_streaming_key(
+            api_key_value, sym_u, session
+        )
+    if api_key_row is None:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    api_key_id = str(api_key_row.id)
+    registered = await _ws_try_register(api_key_id)
+    if not registered:
+        await websocket.accept()
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    notifier = get_tick_notifier()
+    try:
+        queue = notifier.subscribe(sym_u)
+    except Exception:  # noqa: BLE001
+        await _ws_release(api_key_id)
+        logger.exception("stream_ticks_subscribe_failed", symbol=sym_u)
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    try:
+        await websocket.accept()
+    except Exception:  # noqa: BLE001
+        notifier.unsubscribe(sym_u, queue)
+        await _ws_release(api_key_id)
+        raise
+
+    async def _send_json(payload: dict[str, Any]) -> None:
+        await websocket.send_text(json.dumps(payload, default=str))
+
+    async def _heartbeat() -> None:
+        try:
+            while True:
+                await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+                await _send_json(
+                    {"type": "heartbeat", "ts": datetime.now(UTC).isoformat()}
+                )
+        except (WebSocketDisconnect, RuntimeError, ConnectionError):
+            return
+
+    async def _is_revoked() -> bool:
+        try:
+            async with factory() as session:
+                row = await session.get(ApiKey, api_key_row.id)
+        except Exception:  # noqa: BLE001
+            logger.exception("stream_ticks_revocation_check_failed", symbol=sym_u)
+            return False
+        if row is None or not row.is_active:
+            return True
+        if row.expires_at is not None:
+            expires_at = row.expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            if expires_at < datetime.now(UTC):
+                return True
+        return False
+
+    async def _pump() -> None:
+        try:
+            while True:
+                payload = await queue.get()
+                await _send_json({"type": "tick", "symbol": sym_u, "data": payload})
+        except (WebSocketDisconnect, RuntimeError, ConnectionError):
+            return
+
+    async def _revocation_watcher() -> None:
+        try:
+            while True:
+                await asyncio.sleep(REVOCATION_CHECK_INTERVAL_SECONDS)
+                if await _is_revoked():
+                    try:
+                        await websocket.close(code=WS_REVOKED_CODE)
+                    except (RuntimeError, ConnectionError):
+                        pass
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("stream_ticks_revocation_watcher_error", symbol=sym_u)
+
+    pump_task = asyncio.create_task(_pump(), name=f"ws_ticks_pump:{sym_u}")
+    heartbeat_task = asyncio.create_task(_heartbeat(), name=f"ws_ticks_hb:{sym_u}")
+    revoke_task = asyncio.create_task(
+        _revocation_watcher(), name=f"ws_ticks_revoke:{sym_u}"
+    )
+
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:  # noqa: BLE001
+        logger.exception("stream_ticks_ws_error", symbol=sym_u)
+    finally:
+        for t in (pump_task, heartbeat_task, revoke_task):
+            t.cancel()
+        for t in (pump_task, heartbeat_task, revoke_task):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        notifier.unsubscribe(sym_u, queue)
+        await _ws_release(api_key_id)
+
+
+# ── Server-Sent Events fallback (snapshot stream) ───────────────────────────
 
 
 @router.get("/v1/{symbol}/stream/sse")
@@ -373,22 +552,39 @@ async def stream_sse(
 
     async def _stream() -> Any:
         try:
-            # Prime with the latest snapshot.
+            # Prime with the latest snapshot — reuse the cache populated
+            # by the pipeline tick to absorb reconnect storms.
             try:
-                async with factory() as session:
-                    payload, computed_at = await build_snapshot_payload(session, sym_u)
+                cached = get_cached_snapshot(sym_u)
+                if cached is not None:
+                    payload, computed_at = cached
+                else:
+                    async with factory() as session:
+                        payload, computed_at = await build_snapshot_payload(
+                            session, sym_u
+                        )
+                    set_cached_snapshot(sym_u, payload, computed_at)
                 yield _sse_event(_frame(sym_u, computed_at, payload))
             except Exception:  # noqa: BLE001
                 logger.exception("stream_sse_initial_snapshot_failed", symbol=sym_u)
 
+            # Wallclock-driven revocation check: do not rely on the
+            # heartbeat-timeout branch — a pipeline that publishes faster
+            # than ``HEARTBEAT_INTERVAL_SECONDS`` would otherwise stream
+            # forever to a revoked key.
+            last_revocation_check = datetime.now(UTC)
             while True:
+                if (
+                    datetime.now(UTC) - last_revocation_check
+                ).total_seconds() >= REVOCATION_CHECK_INTERVAL_SECONDS:
+                    last_revocation_check = datetime.now(UTC)
+                    if await _is_revoked(api_key_row.id):
+                        break
                 try:
                     queued = await asyncio.wait_for(
                         queue.get(), timeout=HEARTBEAT_INTERVAL_SECONDS
                     )
                 except TimeoutError:
-                    if await _is_revoked(api_key_row.id):
-                        break
                     yield _sse_event(
                         {"type": "heartbeat", "ts": datetime.now(UTC).isoformat()},
                         event="heartbeat",

@@ -18,6 +18,11 @@ import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
+
+# Window is parameterised at call time (settings are loaded once per process
+# but the pipeline can run with overridden settings during tests). The query
+# itself is cached as a single ``text()`` so SQLAlchemy compiles it once.
 SNAPSHOT_QUERY = text(
     """
     SELECT DISTINCT ON (expiration, strike, option_type)
@@ -25,7 +30,7 @@ SNAPSHOT_QUERY = text(
         oi, volume, iv, delta, gamma, last_price, bid, ask, underlying_price
     FROM options_chain
     WHERE symbol = :symbol
-      AND ts > NOW() - INTERVAL '2 days'
+      AND ts > NOW() - make_interval(hours => :window_hours)
     ORDER BY expiration, strike, option_type, ts DESC
     """
 )
@@ -41,7 +46,14 @@ EOD_OI_QUERY = text(
 
 
 async def load_latest_snapshot(session: AsyncSession, symbol: str) -> pd.DataFrame:
-    result = await session.execute(SNAPSHOT_QUERY, {"symbol": symbol})
+    settings = get_settings()
+    result = await session.execute(
+        SNAPSHOT_QUERY,
+        {
+            "symbol": symbol,
+            "window_hours": int(settings.loader_snapshot_window_hours),
+        },
+    )
     rows = result.mappings().all()
     if not rows:
         return pd.DataFrame()

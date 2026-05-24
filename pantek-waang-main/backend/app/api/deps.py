@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.security import (
+    api_key_lookup_digest,
     decode_jwt_token,
     verify_api_key,
 )
@@ -161,15 +162,33 @@ async def authenticate_api_key(
             detail="Missing X-API-Key header",
         )
 
-    prefix = x_api_key[:11]
-    result = await session.execute(select(ApiKey).where(ApiKey.key_prefix == prefix))
-    candidates = result.scalars().all()
-
+    # O(1) lookup via the keyed BLAKE2b digest column. Falls back to the
+    # legacy prefix scan + bcrypt loop when the row was issued before
+    # migration 0010 (``key_lookup IS NULL``). On a successful verify we
+    # backfill the digest so subsequent requests skip the slow path.
     matched: ApiKey | None = None
-    for candidate in candidates:
-        if verify_api_key(x_api_key, candidate.key_hash):
-            matched = candidate
-            break
+    lookup_digest = api_key_lookup_digest(x_api_key)
+    fast = await session.execute(
+        select(ApiKey).where(ApiKey.key_lookup == lookup_digest)
+    )
+    candidate = fast.scalar_one_or_none()
+    if candidate is not None and verify_api_key(x_api_key, candidate.key_hash):
+        matched = candidate
+
+    if matched is None:
+        prefix = x_api_key[:11]
+        result = await session.execute(
+            select(ApiKey).where(
+                ApiKey.key_prefix == prefix,
+                ApiKey.key_lookup.is_(None),
+            )
+        )
+        for row in result.scalars().all():
+            if verify_api_key(x_api_key, row.key_hash):
+                matched = row
+                # Lazy backfill so future requests take the fast path.
+                row.key_lookup = lookup_digest
+                break
 
     if matched is None:
         raise HTTPException(

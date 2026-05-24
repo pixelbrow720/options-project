@@ -88,7 +88,11 @@ class ComputedMetric(Base):
     extra_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     __table_args__ = (
-        Index("ix_computed_metrics_symbol_type_ts", "symbol", "metric_type", "ts"),
+        # ``ix_computed_metrics_symbol_type_ts`` (symbol, metric_type, ts) was
+        # dropped: every "latest per (symbol, metric_type)" lookup also
+        # filters/serves expiration through the wider index below. Keeping
+        # both doubled write amplification on metric upserts (~36 metric_types
+        # × dozens of strikes × every 60 s).
         Index(
             "ix_computed_metrics_symbol_type_exp_ts",
             "symbol",
@@ -146,6 +150,13 @@ class ApiKey(Base):
     )
     key_hash: Mapped[str] = mapped_column(Text, nullable=False)
     key_prefix: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Keyed BLAKE2b lookup digest (hex string). Lets the auth path probe
+    # the row in O(1) instead of bcrypt-verifying every candidate that
+    # shares the same 11-char ``key_prefix``. Nullable for backward
+    # compatibility with rows issued before migration 0010 — the auth
+    # path falls back to the prefix-scan when a row's ``key_lookup`` is
+    # NULL and lazily backfills it on a successful verify.
+    key_lookup: Mapped[str | None] = mapped_column(Text, nullable=True)
     label: Mapped[str] = mapped_column(Text, nullable=False)
     allowed_symbols: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(
@@ -158,6 +169,7 @@ class ApiKey(Base):
 
     __table_args__ = (
         UniqueConstraint("key_hash", name="uq_api_keys_key_hash"),
+        UniqueConstraint("key_lookup", name="uq_api_keys_key_lookup"),
         Index("ix_api_keys_key_prefix", "key_prefix"),
     )
 
@@ -546,7 +558,7 @@ class ContractAdv(Base):
     __tablename__ = "contract_adv"
 
     symbol: Mapped[str] = mapped_column(Text, primary_key=True, nullable=False)
-    expiration: Mapped[datetime] = mapped_column(
+    expiration: Mapped[date] = mapped_column(
         Date, primary_key=True, nullable=False
     )
     strike: Mapped[float] = mapped_column(

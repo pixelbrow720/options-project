@@ -34,7 +34,7 @@ from app.core.logging import get_logger
 from app.db.models import ComputedMetric, PipelineRun, SessionEvent
 from app.db.session import get_session_factory
 from app.processing.gex import GexSummary, compute_gex
-from app.processing.iv import IVSummary, compute_iv_summary, fill_missing_iv
+from app.processing.iv import IVSummary, compute_iv_summary, fill_missing_iv_async
 from app.processing.loader import load_latest_snapshot
 from app.processing.max_pain import MaxPainSummary, compute_max_pain
 from app.processing.move_tracker import MoveSnapshot, compute_move_tracker
@@ -213,12 +213,14 @@ def _coverage_ok(df: pd.DataFrame) -> tuple[bool, dict[str, float]]:
 
 async def _persist_metrics(
     session: AsyncSession, *, symbol: str, ts: datetime, result: PipelineResult
-) -> int:
+) -> tuple[int, set[str]]:
     """Upsert all metrics into ``computed_metrics`` inside a single transaction.
 
     If any statement in the transaction fails the entire upsert is rolled
     back so the next tick observes the prior state, not a half-written one.
-    Returns the number of rows that would have been inserted.
+    Returns ``(row_count, persisted_metric_type_set)`` so the caller can
+    derive ``missing_metric_types`` from the in-memory set instead of
+    re-querying the DB on a fresh session (saves one round-trip per tick).
     """
     rows: list[dict] = []
     sentinel_expiry = pd.Timestamp("1970-01-01").date()
@@ -673,7 +675,7 @@ async def _persist_metrics(
         )
 
     if not rows:
-        return 0
+        return 0, set()
 
     stmt = insert(ComputedMetric).values(rows)
     stmt = stmt.on_conflict_do_update(
@@ -693,7 +695,8 @@ async def _persist_metrics(
     except Exception:
         await session.rollback()
         raise
-    return len(rows)
+    persisted = {row["metric_type"] for row in rows}
+    return len(rows), persisted
 
 
 async def _latest_persisted_metric_types(
@@ -825,7 +828,9 @@ async def run_pipeline_for_symbol(symbol: str) -> PipelineResult | None:
         rows_read = int(len(df))
 
         if spot is not None and not df.empty:
-            df = df.copy()
+            # ``df`` is a fresh DataFrame from ``load_latest_snapshot`` —
+            # no shared ownership, so an in-place column write is safe and
+            # avoids a ~10–20 MB allocation on every tick for SPX.
             df["underlying_price"] = float(spot.price)
 
         if df.empty:
@@ -834,8 +839,11 @@ async def run_pipeline_for_symbol(symbol: str) -> PipelineResult | None:
             missing = sorted(EXPECTED_METRIC_TYPES)
         else:
             # Run IV inversion before the coverage check so synthesized IV
-            # also counts toward the threshold.
-            df = fill_missing_iv(df, risk_free_rate=settings.risk_free_rate)
+            # also counts toward the threshold. CPU-bound — runs in a
+            # worker thread so the event loop keeps serving WS/SSE.
+            df = await fill_missing_iv_async(
+                df, risk_free_rate=settings.risk_free_rate
+            )
             cov_ok, cov_diag = _coverage_ok(df)
             if not cov_ok:
                 logger.warning(
@@ -856,14 +864,14 @@ async def run_pipeline_for_symbol(symbol: str) -> PipelineResult | None:
                 result.session_state = sess_state
 
                 async with factory() as session:
-                    metric_rows_written = await _persist_metrics(
+                    metric_rows_written, persisted = await _persist_metrics(
                         session, symbol=symbol, ts=ts, result=result
                     )
 
-                async with factory() as session:
-                    persisted = await _latest_persisted_metric_types(
-                        session, symbol=symbol, ts=ts
-                    )
+                # Derive the missing-metrics diff from the in-memory
+                # persisted set rather than re-querying — saves one DB
+                # round-trip per pipeline tick. ``_latest_persisted_metric_types``
+                # remains exported for ad-hoc admin / inspector use.
                 missing = _missing_metric_types(persisted)
                 status = "ok" if not missing else "partial"
 
@@ -928,7 +936,10 @@ async def _publish_streaming_snapshot(symbol: str) -> None:
     surface at import time. The notifier itself drops the oldest queued
     frame for slow subscribers, so this never blocks the pipeline.
     """
-    from app.api.endpoints.snapshot import build_snapshot_payload
+    from app.api.endpoints.snapshot import (
+        build_snapshot_payload,
+        set_cached_snapshot,
+    )
     from app.api.stream_notifier import get_stream_notifier
 
     notifier = get_stream_notifier()
@@ -937,6 +948,9 @@ async def _publish_streaming_snapshot(symbol: str) -> None:
     factory = get_session_factory()
     async with factory() as session:
         payload, computed_at = await build_snapshot_payload(session, symbol)
+    # Write through so a reconnecting client primes from the in-memory
+    # cache rather than re-running the 26-metric batch query.
+    set_cached_snapshot(symbol, payload, computed_at)
     await notifier.publish(
         symbol, {"data": payload, "computed_at": computed_at}
     )

@@ -37,6 +37,8 @@ from typing import Final
 from zoneinfo import ZoneInfo
 
 import holidays  # type: ignore[import-untyped]
+import numpy as np
+import pandas as pd
 
 from app.config import get_settings
 from app.core.logging import get_logger
@@ -264,6 +266,44 @@ def time_to_expiry_0dte_years(*, now: datetime | None = None) -> float:
     if moment < open_dt:
         return max(0.0, (close_dt - open_dt).total_seconds() / SECONDS_PER_YEAR)
     return max(0.0, (close_dt - moment).total_seconds() / SECONDS_PER_YEAR)
+
+
+# ── Vectorised calendar-day τ helper ─────────────────────────────────────────
+
+
+def calendar_tau_years(
+    expirations: pd.Series,
+    *,
+    today: pd.Timestamp | date | None = None,
+    floor_days: int = 1,
+) -> pd.Series:
+    """Vectorised calendar-day τ-in-years for a Series of expiration dates.
+
+    Replaces per-row ``df.apply(lambda exp: max(1, (d - today).days)/365)``
+    patterns scattered across the processing modules. Single source of truth
+    for the calendar convention (365.0 day-count, ``floor_days``-day floor).
+
+    Returns a float Series aligned with ``expirations.index``. Unparseable
+    rows return 0.0 so downstream callers can filter on ``tau > 0``.
+    """
+    if today is None:
+        today_d = _now_eastern().date()
+    elif isinstance(today, pd.Timestamp):
+        today_d = today.date()
+    elif isinstance(today, datetime):
+        today_d = today.date()
+    else:
+        today_d = today
+
+    parsed = pd.to_datetime(expirations, errors="coerce")
+    days = (parsed.dt.normalize() - pd.Timestamp(today_d)).dt.days
+    days = days.fillna(-1)
+    days = days.where(days >= 0, -1)
+    floored = np.maximum(days.to_numpy(dtype=float), float(floor_days))
+    out = floored / 365.0
+    out = np.where(days.to_numpy() < 0, 0.0, out)
+    return pd.Series(out, index=expirations.index, dtype=float)
+
 
 
 def is_expiration_day(symbol: str, *, today: date | None = None) -> bool:

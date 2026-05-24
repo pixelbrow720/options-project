@@ -29,6 +29,7 @@ from app.api.schemas import (
 from app.config import get_settings
 from app.core.crypto import decrypt_secret, encrypt_secret, mask_prefix
 from app.core.security import (
+    api_key_lookup_digest,
     create_jwt_token,
     display_prefix,
     generate_api_key,
@@ -62,22 +63,26 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 )
 async def admin_login(payload: AdminLoginRequest) -> AdminLoginResponse:
     settings = get_settings()
-    if payload.username != settings.admin_username:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
-        )
     # The admin password is bootstrapped from env. We accept either:
     #   1) a plaintext value matching ADMIN_PASSWORD, or
     #   2) a bcrypt-hashed value matching the admin password (for prod).
     is_hash = settings.admin_password.startswith("$2")
+    # Always run the password check BEFORE comparing usernames so a bad
+    # username and a bad password take the same CPU time. Comparing the
+    # username first short-circuits bcrypt and lets an attacker enumerate
+    # valid usernames in <5 attempts via a timing oracle.
     if is_hash:
-        valid = verify_password(payload.password, settings.admin_password)
+        password_ok = verify_password(payload.password, settings.admin_password)
     else:
-        valid = hmac.compare_digest(
+        password_ok = hmac.compare_digest(
             payload.password.encode("utf-8"),
             settings.admin_password.encode("utf-8"),
         )
-    if not valid:
+    username_ok = hmac.compare_digest(
+        payload.username.encode("utf-8"),
+        settings.admin_username.encode("utf-8"),
+    )
+    if not (username_ok and password_ok):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
         )
@@ -123,6 +128,7 @@ async def create_api_key(
     record = ApiKey(
         key_hash=hash_api_key(plaintext),
         key_prefix=display_prefix(plaintext),
+        key_lookup=api_key_lookup_digest(plaintext),
         label=payload.label,
         allowed_symbols=payload.allowed_symbols,
         expires_at=payload.expires_at,
@@ -317,6 +323,119 @@ async def system_status(
         last_pipeline_runs=last_runs,
         live_ingester=live_diag,
     )
+
+
+# ── Prometheus exposition (Rev 6) ────────────────────────────────────────────
+
+
+def _fmt_metric(name: str, value: float | None, labels: dict[str, str] | None = None) -> str:
+    """Render one Prometheus sample line. ``None`` values are skipped."""
+    if value is None:
+        return ""
+    if labels:
+        label_str = ",".join(
+            f'{k}="{v.replace(chr(92), chr(92) * 2).replace(chr(34), chr(92) + chr(34))}"'
+            for k, v in sorted(labels.items())
+        )
+        return f"{name}{{{label_str}}} {value}\n"
+    return f"{name} {value}\n"
+
+
+@router.get("/metrics", response_class=Response)
+async def admin_metrics(
+    _admin: Annotated[str, Depends(authenticate_admin)],
+    session: AsyncSession = Depends(get_db),
+) -> Response:
+    """Prometheus text-format exposition of the same gauges as ``/system/status``.
+
+    Designed for an external Prometheus scraper. JWT-protected (no anonymous
+    scrape) — set up your scraper with the admin token in
+    ``authorization`` header. The contract is intentionally narrow:
+    only stable gauges, no histograms (those would need an in-process
+    metric registry which is out of scope).
+    """
+    settings = get_settings()
+    state = get_pipeline_state()
+
+    futures_latest = (
+        await session.execute(select(func.max(FuturesTick.ts)))
+    ).scalar_one_or_none()
+    opra_latest = (
+        await session.execute(select(func.max(OptionsChain.ts)))
+    ).scalar_one_or_none()
+    dlq_pending = int(
+        (
+            await session.execute(
+                select(func.count()).select_from(DeadLetterEntry)
+            )
+        ).scalar_one()
+        or 0
+    )
+    active_keys = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(ApiKey)
+                .where(ApiKey.is_active.is_(True))
+            )
+        ).scalar_one()
+        or 0
+    )
+
+    # Pool metrics — sync introspection on the underlying SQLAlchemy pool.
+    pool = session.bind.sync_engine.pool  # type: ignore[union-attr]
+    pool_size = getattr(pool, "size", lambda: 0)()
+    pool_checked_out = getattr(pool, "checkedout", lambda: 0)()
+    pool_overflow = getattr(pool, "overflow", lambda: 0)()
+
+    lines: list[str] = []
+    lines.append("# HELP ofa_pipeline_running 1 when the pipeline scheduler has run at least once\n")
+    lines.append("# TYPE ofa_pipeline_running gauge\n")
+    lines.append(_fmt_metric("ofa_pipeline_running", 1.0 if state.last_run else 0.0))
+
+    lines.append("# HELP ofa_last_compute_age_seconds seconds since last successful pipeline tick\n")
+    lines.append("# TYPE ofa_last_compute_age_seconds gauge\n")
+    now = datetime.now(UTC)
+    for sym in settings.supported_symbols:
+        ts = state.last_run.get(sym)
+        if ts is None:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        age = (now - ts).total_seconds()
+        lines.append(_fmt_metric("ofa_last_compute_age_seconds", age, {"symbol": sym}))
+
+    lines.append("# HELP ofa_db_pool_size configured DB pool size\n")
+    lines.append("# TYPE ofa_db_pool_size gauge\n")
+    lines.append(_fmt_metric("ofa_db_pool_size", float(pool_size)))
+
+    lines.append("# HELP ofa_db_pool_checked_out connections currently in use\n")
+    lines.append("# TYPE ofa_db_pool_checked_out gauge\n")
+    lines.append(_fmt_metric("ofa_db_pool_checked_out", float(pool_checked_out)))
+
+    lines.append("# HELP ofa_db_pool_overflow connections beyond pool_size\n")
+    lines.append("# TYPE ofa_db_pool_overflow gauge\n")
+    lines.append(_fmt_metric("ofa_db_pool_overflow", float(pool_overflow)))
+
+    lines.append("# HELP ofa_dlq_pending dead_letter_queue row count\n")
+    lines.append("# TYPE ofa_dlq_pending gauge\n")
+    lines.append(_fmt_metric("ofa_dlq_pending", float(dlq_pending)))
+
+    opra_lag = _lag_ms(opra_latest)
+    fut_lag = _lag_ms(futures_latest)
+    lines.append("# HELP ofa_opra_lag_ms ms since last options_chain row\n")
+    lines.append("# TYPE ofa_opra_lag_ms gauge\n")
+    lines.append(_fmt_metric("ofa_opra_lag_ms", opra_lag))
+    lines.append("# HELP ofa_futures_lag_ms ms since last futures_ticks row\n")
+    lines.append("# TYPE ofa_futures_lag_ms gauge\n")
+    lines.append(_fmt_metric("ofa_futures_lag_ms", fut_lag))
+
+    lines.append("# HELP ofa_active_api_keys count of active API keys\n")
+    lines.append("# TYPE ofa_active_api_keys gauge\n")
+    lines.append(_fmt_metric("ofa_active_api_keys", float(active_keys)))
+
+    body = "".join(lines)
+    return Response(content=body, media_type="text/plain; version=0.0.4")
 
 
 # ── Databento API key pool (Rev 4) ───────────────────────────────────────────

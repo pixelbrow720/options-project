@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 from datetime import UTC, datetime, timedelta
 
@@ -22,6 +23,15 @@ API_KEY_DISPLAY_PREFIX_LEN = 11  # "ak_" + 8 chars
 # hashes keep their stored cost — bcrypt encodes the cost in the digest, so
 # raising this only affects hashes generated *after* the change.
 BCRYPT_ROUNDS = 12
+
+# Domain-separated keyed BLAKE2b for the ``api_keys.key_lookup`` column.
+# Purpose: an O(1) equality probe that lets ``authenticate_api_key`` skip
+# the bcrypt-everyone-with-this-prefix loop. Bcrypt remains the
+# authoritative verifier — this column is an *index*, not a credential.
+# The fixed key just domain-separates this digest from any other place
+# the same plaintext might be hashed (no rotation concerns; if we ever
+# need to rotate, generate a new column and migrate lazily on verify).
+_API_KEY_LOOKUP_KEY: bytes = b"pantek-waang.api-key-lookup.v1"
 
 # Defaults shipped in the source tree / used by the test suite. These are
 # safe for local dev but must NEVER be left in place in production: see
@@ -52,6 +62,19 @@ def hash_api_key(api_key: str) -> str:
     return bcrypt.hashpw(
         api_key.encode("utf-8"), bcrypt.gensalt(rounds=BCRYPT_ROUNDS)
     ).decode("utf-8")
+
+
+def api_key_lookup_digest(api_key: str) -> str:
+    """Return the BLAKE2b lookup digest for ``api_key`` (hex string).
+
+    Used for O(1) candidate lookup in ``api_keys.key_lookup``. Prefer
+    this over the legacy ``key_prefix`` scan whenever possible — prefix
+    collisions made every authenticated request pay multiple bcrypt
+    verifications when the prefix universe is densely populated.
+    """
+    return hashlib.blake2b(
+        api_key.encode("utf-8"), key=_API_KEY_LOOKUP_KEY, digest_size=32
+    ).hexdigest()
 
 
 def verify_api_key(api_key: str, key_hash: str) -> bool:
