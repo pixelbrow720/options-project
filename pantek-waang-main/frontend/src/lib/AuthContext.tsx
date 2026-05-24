@@ -18,7 +18,14 @@ interface AuthValue {
 const AuthContext = createContext<AuthValue | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [token, setTokenState] = useState<string | null>(getStoredToken());
+  const [token, setTokenState] = useState<string | null>(() => {
+    // Fixture mode bypasses auth so the design pass can iterate the
+    // dashboard without a running backend or admin login.
+    if (import.meta.env.VITE_USE_FIXTURE === "1") {
+      return "fixture-mode-token";
+    }
+    return getStoredToken();
+  });
 
   useEffect(() => {
     function onStorage(e: StorageEvent) {

@@ -18,7 +18,6 @@ import {
   type FuturesLevelsSnapshot,
 } from "@/lib/api";
 import {
-  LiveSnapshotProvider,
   setStoredApiKey,
   useLiveSnapshot,
   type GexStrike,
@@ -1148,9 +1147,7 @@ function StatTile({
 // ── Page wrapper ──────────────────────────────────────────────────────────
 
 export function ZeroDtePage() {
-  return (
-    <LiveSnapshotProvider initialSymbol="SPXW">
-      <ZeroDteInner />
-    </LiveSnapshotProvider>
-  );
+  // Provider is hoisted in App.tsx so the topbar pill stays in sync across
+  // pages — ZeroDteInner just consumes the existing context.
+  return <ZeroDteInner />;
 }

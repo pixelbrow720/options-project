@@ -1,31 +1,48 @@
-import { memo, useMemo } from "react";
+/**
+ * GexChart V2 — premium per-strike Gamma Exposure visualisation.
+ *
+ * Rendered with lightweight-charts (TradingView) as a bar chart, with
+ * positive (call-dominant) bars green and negative (put-dominant) bars
+ * rose, plus reference lines for spot and zero-gamma. Ticks the
+ * SpotGamma aesthetic for "where the dealer hedges flip".
+ */
+
 import {
-  Area,
-  AreaChart,
-  CartesianGrid,
-  ReferenceLine,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
+  CrosshairMode,
+  LineStyle,
+  type IChartApi,
+  type ISeriesApi,
+  type UTCTimestamp,
+  createChart,
+} from "lightweight-charts";
+import { memo, useEffect, useMemo, useRef } from "react";
 import {
-  Card,
-  CardContent,
-  CardDescription,
+  CardBody,
+  CardFooter,
   CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+  MetricTile,
+  SurfaceCard,
+} from "@/components/ui/surface";
 import type { GexPayload } from "@/lib/streamClient";
+import { cn } from "@/lib/utils";
+
+const COLORS = {
+  positive: "#14E0A0",
+  negative: "#F94D6D",
+  spot: "#FFB033",
+  zeroGamma: "#B299FF",
+  grid: "rgba(255,255,255,0.04)",
+  border: "rgba(255,255,255,0.08)",
+  text: "rgba(232,234,242,0.85)",
+};
 
 function formatStrike(value: number): string {
-  if (Math.abs(value) >= 1000) return value.toFixed(0);
-  return value.toString();
+  return Math.abs(value) >= 1000 ? value.toFixed(0) : value.toString();
 }
 
 function formatGex(value: number): string {
   const abs = Math.abs(value);
-  if (abs >= 1e9) return `${(value / 1e9).toFixed(1)}B`;
+  if (abs >= 1e9) return `${(value / 1e9).toFixed(2)}B`;
   if (abs >= 1e6) return `${(value / 1e6).toFixed(1)}M`;
   if (abs >= 1e3) return `${(value / 1e3).toFixed(1)}K`;
   return value.toFixed(0);
@@ -38,117 +55,190 @@ export interface GexChartProps {
 }
 
 function GexChartImpl({ payload, title = "GEX", description }: GexChartProps) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const chartRef = useRef<IChartApi | null>(null);
+  const seriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+
   const data = useMemo(() => {
     const curve = payload?.curve ?? [];
     return [...curve]
-      .filter((p) => Number.isFinite(p.strike) && Number.isFinite(p.net_gex))
+      .filter(
+        (p) =>
+          Number.isFinite(p.strike) && Number.isFinite(p.net_gex),
+      )
       .sort((a, b) => a.strike - b.strike)
-      .map((p) => ({ strike: p.strike, gex: p.net_gex }));
+      .map((p) => ({
+        // Lightweight-charts indexes time-axis as UTC seconds; we abuse it
+        // here as a strike axis by encoding strike directly. The chart
+        // displays the value via a custom formatter; a real time-axis is
+        // unnecessary for this distribution chart.
+        time: Math.round(p.strike) as UTCTimestamp,
+        value: p.net_gex,
+        color: p.net_gex >= 0 ? COLORS.positive : COLORS.negative,
+      }));
   }, [payload]);
 
   const zeroGamma = payload?.zero_gamma ?? null;
   const underlying = payload?.underlying_price ?? null;
   const netTotal = payload?.net_total ?? 0;
+  const positive = netTotal >= 0;
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const chart = createChart(el, {
+      layout: {
+        background: { color: "transparent" },
+        textColor: COLORS.text,
+        fontFamily: "Geist Mono, ui-monospace, monospace",
+        fontSize: 11,
+      },
+      grid: {
+        horzLines: { color: COLORS.grid },
+        vertLines: { color: COLORS.grid },
+      },
+      rightPriceScale: {
+        borderColor: COLORS.border,
+        scaleMargins: { top: 0.12, bottom: 0.12 },
+      },
+      timeScale: {
+        borderColor: COLORS.border,
+        tickMarkFormatter: (time: number) => formatStrike(time),
+        fixLeftEdge: true,
+        fixRightEdge: true,
+      },
+      crosshair: {
+        mode: CrosshairMode.Magnet,
+        vertLine: {
+          color: "rgba(178,153,255,0.4)",
+          width: 1,
+          style: LineStyle.Solid,
+          labelBackgroundColor: "#1B1F2A",
+        },
+        horzLine: {
+          color: "rgba(178,153,255,0.4)",
+          width: 1,
+          style: LineStyle.Solid,
+          labelBackgroundColor: "#1B1F2A",
+        },
+      },
+      autoSize: true,
+    });
+    chartRef.current = chart;
+
+    seriesRef.current = chart.addHistogramSeries({
+      priceFormat: {
+        type: "custom",
+        formatter: formatGex,
+        minMove: 1,
+      },
+      base: 0,
+      priceLineVisible: false,
+      lastValueVisible: false,
+    });
+
+    return () => {
+      chart.remove();
+      chartRef.current = null;
+      seriesRef.current = null;
+    };
+  }, []);
+
+  // Push data + reference lines.
+  useEffect(() => {
+    const chart = chartRef.current;
+    const series = seriesRef.current;
+    if (!chart || !series) return;
+    series.setData(data);
+
+    // Clear and re-add reference price lines (lightweight-charts requires
+    // explicit removal, but we re-create the series implicitly here by
+    // dropping all then adding). For reference *price-lines* we use
+    // ``createPriceLine`` instead — but those don't support time-axis
+    // markers. Strike axis is on time, so we render markers via series
+    // markers below.
+
+    series.setMarkers([
+      ...(underlying !== null && Number.isFinite(underlying)
+        ? [
+            {
+              time: Math.round(underlying as number) as UTCTimestamp,
+              position: "aboveBar" as const,
+              color: COLORS.spot,
+              shape: "arrowDown" as const,
+              text: `Spot ${(underlying as number).toFixed(0)}`,
+            },
+          ]
+        : []),
+      ...(zeroGamma !== null && Number.isFinite(zeroGamma)
+        ? [
+            {
+              time: Math.round(zeroGamma as number) as UTCTimestamp,
+              position: "belowBar" as const,
+              color: COLORS.zeroGamma,
+              shape: "arrowUp" as const,
+              text: `0γ ${(zeroGamma as number).toFixed(0)}`,
+            },
+          ]
+        : []),
+    ]);
+
+    if (data.length > 0) chart.timeScale().fitContent();
+  }, [data, underlying, zeroGamma]);
 
   return (
-    <Card data-testid="gex-chart-card">
-      <CardHeader className="space-y-1">
-        <div className="flex items-center justify-between gap-2">
-          <CardTitle>{title}</CardTitle>
-          <div className="text-right">
-            <div className="text-xs text-muted-foreground">Net total</div>
-            <div
-              className={
-                netTotal >= 0
-                  ? "text-base font-semibold text-emerald-400"
-                  : "text-base font-semibold text-red-400"
-              }
-            >
-              {formatGex(netTotal)}
-            </div>
-          </div>
-        </div>
-        {description && <CardDescription>{description}</CardDescription>}
-      </CardHeader>
-      <CardContent>
+    <SurfaceCard
+      variant={positive ? "positive" : "negative"}
+      className="flex h-full flex-col"
+    >
+      <CardHeader
+        title={title}
+        subtitle={description ?? "Per-strike dealer gamma exposure"}
+        action={
+          <MetricTile
+            label="Net total"
+            value={formatGex(netTotal)}
+            tone={positive ? "positive" : "negative"}
+            size="sm"
+            className="text-right items-end"
+          />
+        }
+      />
+      <CardBody className="flex flex-1 flex-col">
         {data.length === 0 ? (
-          <div className="flex h-64 items-center justify-center text-sm text-muted-foreground">
+          <div className="flex h-64 items-center justify-center text-sm text-fg-muted">
             No GEX data yet.
           </div>
         ) : (
-          <div className="h-64 w-full" data-testid="gex-chart-body">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={data} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="gexPositive" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#34d399" stopOpacity={0.7} />
-                    <stop offset="100%" stopColor="#34d399" stopOpacity={0.05} />
-                  </linearGradient>
-                  <linearGradient id="gexNegative" x1="0" y1="1" x2="0" y2="0">
-                    <stop offset="0%" stopColor="#f87171" stopOpacity={0.7} />
-                    <stop offset="100%" stopColor="#f87171" stopOpacity={0.05} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid stroke="hsl(215 28% 17%)" strokeDasharray="3 3" />
-                <XAxis
-                  dataKey="strike"
-                  tickFormatter={formatStrike}
-                  stroke="hsl(215 20% 65%)"
-                  fontSize={11}
-                />
-                <YAxis
-                  tickFormatter={formatGex}
-                  stroke="hsl(215 20% 65%)"
-                  fontSize={11}
-                  width={56}
-                />
-                <Tooltip
-                  contentStyle={{
-                    background: "hsl(222 47% 7%)",
-                    border: "1px solid hsl(215 28% 17%)",
-                    fontSize: 12,
-                  }}
-                  labelFormatter={(v) => `Strike ${formatStrike(Number(v))}`}
-                  formatter={(v: number) => [formatGex(Number(v)), "GEX"]}
-                />
-                <ReferenceLine y={0} stroke="hsl(215 20% 65%)" strokeDasharray="2 2" />
-                {zeroGamma != null && Number.isFinite(zeroGamma) && (
-                  <ReferenceLine
-                    x={zeroGamma}
-                    stroke="#38bdf8"
-                    strokeDasharray="3 3"
-                    label={{ value: "0γ", fill: "#38bdf8", position: "top", fontSize: 11 }}
-                  />
-                )}
-                {underlying != null && Number.isFinite(underlying) && (
-                  <ReferenceLine
-                    x={underlying}
-                    stroke="#facc15"
-                    strokeDasharray="3 3"
-                    label={{ value: "Spot", fill: "#facc15", position: "top", fontSize: 11 }}
-                  />
-                )}
-                <Area
-                  type="monotone"
-                  dataKey="gex"
-                  stroke="#34d399"
-                  fill="url(#gexPositive)"
-                  isAnimationActive={false}
-                  baseValue={0}
-                />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
+          <div ref={containerRef} className="min-h-[260px] flex-1" />
         )}
-      </CardContent>
-    </Card>
+      </CardBody>
+      <CardFooter className="flex items-center justify-between text-[10px]">
+        <div className="flex items-center gap-3 text-fg-muted">
+          <span className="flex items-center gap-1.5">
+            <span
+              className="h-1.5 w-3 rounded-sm"
+              style={{ background: COLORS.positive }}
+            />
+            Long γ
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span
+              className="h-1.5 w-3 rounded-sm"
+              style={{ background: COLORS.negative }}
+            />
+            Short γ
+          </span>
+        </div>
+        <div className={cn("font-mono uppercase tracking-wider", "text-fg-faint")}>
+          {data.length} strikes
+        </div>
+      </CardFooter>
+    </SurfaceCard>
   );
 }
 
-// The chart re-renders on every WS frame even when the curve hasn't changed
-// (recharts is expensive). Skip the render if the payload is identifiably
-// the same: same length, same total, same computed_at marker (which the
-// backend bumps whenever a new frame is produced).
 export const GexChart = memo(GexChartImpl, (prev, next) => {
   if (prev.title !== next.title || prev.description !== next.description) return false;
   const a = prev.payload;

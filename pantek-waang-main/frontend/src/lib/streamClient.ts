@@ -102,13 +102,30 @@ export interface RegimePayload {
 
 export interface HiroSeriesPoint {
   ts: string;
-  value: number;
+  /** Pre-Rev 6 scalar — kept for legacy consumers. */
+  value?: number;
+  /** Per-bucket reset cumulative (Rev 6 — equals net of the bucket). */
+  cumulative?: number;
+  // Legacy signed-premium breakdown (USD)
+  call_premium?: number;
+  put_premium?: number;
+  net_premium?: number;
+  // Rev 6 — canonical SpotGamma delta-notional fields (share-equivalents)
+  call_delta_notional?: number;
+  put_delta_notional?: number;
+  net_delta_notional?: number;
+  next_expiry_delta_notional?: number;
+  next_expiry_premium?: number;
+  weight_source?: "delta_notional" | "signed_premium";
 }
 
 export interface HiroPayload {
   bucket_size?: string;
   cumulative: number;
   series: HiroSeriesPoint[];
+  /** Aggregate provenance — ``delta_notional`` if every bucket had delta data,
+   * ``signed_premium`` if every bucket fell back, ``mixed`` otherwise. */
+  weight_source?: "delta_notional" | "signed_premium" | "mixed";
 }
 
 export interface FlowEvent {
@@ -506,6 +523,29 @@ export function LiveSnapshotProvider({ initialSymbol, children }: LiveSnapshotPr
   };
 
   useEffect(() => {
+    // Fixture mode bypasses the WS entirely so the frontend can be developed
+    // without a running backend (Sundays, design iteration, demos).
+    // Activate via ``VITE_USE_FIXTURE=1`` in ``.env`` or shell.
+    if (import.meta.env.VITE_USE_FIXTURE === "1") {
+      let cancelled = false;
+      void (async () => {
+        const { FRIDAY_FIXTURE } = await import("./fixtureSnapshot");
+        if (cancelled) return;
+        // Yield asynchronously so consumers see "connecting" → "open"
+        // transition just like a real WS would.
+        setStatus("connecting");
+        setTimeout(() => {
+          if (cancelled) return;
+          setSnapshot({ ...FRIDAY_FIXTURE, symbol });
+          setLastFrameAt(Date.now());
+          setStatus("open");
+        }, 250);
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }
+
     if (!symbol || !apiKey) {
       setStatus("closed");
       return;

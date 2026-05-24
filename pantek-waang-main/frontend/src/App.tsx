@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Layout } from "./components/Layout";
 import { useAuth } from "./lib/AuthContext";
+import { LiveSnapshotProvider } from "./lib/streamClient";
 import { ApiKeysPage } from "./pages/ApiKeys";
 import { DashboardPage } from "./pages/Dashboard";
 import { DataInspectorPage } from "./pages/DataInspector";
@@ -14,7 +15,13 @@ import { ZeroDtePage } from "./pages/ZeroDte";
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { token } = useAuth();
   if (!token) return <Navigate to="/login" replace />;
-  return <Layout>{children}</Layout>;
+  // Provider hoisted from per-page → app-shell so the topbar can render
+  // the live connection pill on every protected page.
+  return (
+    <LiveSnapshotProvider initialSymbol="SPXW">
+      <Layout>{children}</Layout>
+    </LiveSnapshotProvider>
+  );
 }
 
 export function App() {

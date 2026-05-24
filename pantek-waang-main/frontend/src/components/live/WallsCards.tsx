@@ -1,12 +1,16 @@
+/**
+ * WallsCards V2 — Call walls / Put walls / Max pain.
+ *
+ * Premium tile design: each row shows strike + bar visualisation
+ * (relative-to-max), so a row's importance is conveyed at a glance.
+ * Max pain card lifts the aggregate strike as a hero number.
+ */
+
+import { motion } from "framer-motion";
 import { useMemo } from "react";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import { CardBody, CardHeader, MetricTile, SurfaceCard } from "@/components/ui/surface";
 import type { MaxPainPayload, WallsPayload, WallStrike } from "@/lib/streamClient";
+import { cn } from "@/lib/utils";
 
 function formatStrike(value: number): string {
   return Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 });
@@ -25,36 +29,67 @@ function topN(rows: WallStrike[] | undefined, n: number): WallStrike[] {
   return [...rows].sort((a, b) => (a.rank || 999) - (b.rank || 999)).slice(0, n);
 }
 
-interface WallsCardProps {
+function WallTile({
+  title,
+  hint,
+  rows,
+  accent,
+}: {
   title: string;
-  description: string;
+  hint: string;
   rows: WallStrike[];
   accent: "call" | "put";
-}
+}) {
+  const max = rows.length ? Math.max(...rows.map((r) => r.value), 1) : 1;
+  const tone = accent === "call" ? "text-positive" : "text-negative";
+  const barTone =
+    accent === "call"
+      ? "from-positive/60 to-positive/0"
+      : "from-negative/60 to-negative/0";
 
-function WallsCard({ title, description, rows, accent }: WallsCardProps) {
-  const colorClass = accent === "call" ? "text-emerald-400" : "text-red-400";
   return (
-    <Card>
-      <CardHeader className="space-y-1 pb-3">
-        <CardTitle className="text-base">{title}</CardTitle>
-        <CardDescription>{description}</CardDescription>
-      </CardHeader>
-      <CardContent>
+    <SurfaceCard variant={accent === "call" ? "positive" : "negative"} className="flex flex-col">
+      <CardHeader title={title} subtitle={hint} />
+      <CardBody className="space-y-2">
         {rows.length === 0 ? (
-          <div className="text-sm text-muted-foreground">No data yet.</div>
+          <div className="py-3 text-sm text-fg-muted">No data yet.</div>
         ) : (
-          <ul className="space-y-2 text-sm">
-            {rows.map((r) => (
-              <li key={`${r.rank}-${r.strike}`} className="flex items-center justify-between">
-                <span className={`font-mono ${colorClass}`}>{formatStrike(r.strike)}</span>
-                <span className="font-mono text-muted-foreground">{formatBig(r.value)}</span>
-              </li>
-            ))}
-          </ul>
+          rows.map((r, idx) => {
+            const pct = (r.value / max) * 100;
+            return (
+              <motion.div
+                key={`${r.rank}-${r.strike}`}
+                initial={{ opacity: 0, x: -4 }}
+                animate={{ opacity: 1, x: 0 }}
+                transition={{ duration: 0.18, delay: idx * 0.04 }}
+                className="relative overflow-hidden rounded-md bg-bg-elevated/60 px-3 py-2"
+              >
+                <div
+                  className={cn(
+                    "pointer-events-none absolute inset-y-0 left-0 bg-gradient-to-r",
+                    barTone,
+                  )}
+                  style={{ width: `${pct}%` }}
+                />
+                <div className="relative flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-[10px] text-fg-faint tabular-nums">
+                      #{r.rank}
+                    </span>
+                    <span className={cn("font-mono text-sm font-semibold tabular-nums", tone)}>
+                      {formatStrike(r.strike)}
+                    </span>
+                  </div>
+                  <span className="font-mono text-xs text-fg-muted tabular-nums">
+                    {formatBig(r.value)}
+                  </span>
+                </div>
+              </motion.div>
+            );
+          })
         )}
-      </CardContent>
-    </Card>
+      </CardBody>
+    </SurfaceCard>
   );
 }
 
@@ -72,51 +107,51 @@ export function WallsCards({ walls, maxPain }: WallsCardsProps) {
 
   return (
     <div className="grid gap-4 md:grid-cols-3">
-      <WallsCard
+      <WallTile
         title="Call walls"
-        description="Top OI strikes (resistance)"
+        hint="Top OI strikes — resistance"
         rows={callRows}
         accent="call"
       />
-      <WallsCard
+      <WallTile
         title="Put walls"
-        description="Top OI strikes (support)"
+        hint="Top OI strikes — support"
         rows={putRows}
         accent="put"
       />
-      <Card>
-        <CardHeader className="space-y-1 pb-3">
-          <CardTitle className="text-base">Max pain</CardTitle>
-          <CardDescription>Aggregate + nearest expiries</CardDescription>
-        </CardHeader>
-        <CardContent>
+      <SurfaceCard variant="default" className="flex flex-col">
+        <CardHeader title="Max pain" subtitle="Aggregate + nearest expiries" />
+        <CardBody className="flex flex-col gap-3">
           {aggregate ? (
-            <div className="mb-3">
-              <div className="text-xs text-muted-foreground">Aggregate strike</div>
-              <div className="text-xl font-semibold text-amber-300">
-                {formatStrike(aggregate.strike)}
-              </div>
-              <div className="text-xs text-muted-foreground">
-                Pain {formatBig(aggregate.value)}
-              </div>
-            </div>
+            <MetricTile
+              label="Aggregate strike"
+              value={formatStrike(aggregate.strike)}
+              hint={`Pain ${formatBig(aggregate.value)}`}
+              tone="flip"
+              size="lg"
+            />
           ) : (
-            <div className="mb-3 text-sm text-muted-foreground">No aggregate yet.</div>
+            <div className="text-sm text-fg-muted">No aggregate yet.</div>
           )}
-          {perExpiry.length === 0 ? (
-            <div className="text-sm text-muted-foreground">No per-expiry data yet.</div>
-          ) : (
-            <ul className="space-y-2 text-sm">
+          {perExpiry.length > 0 && (
+            <ul className="mt-1 space-y-1.5 border-t border-border-subtle/60 pt-3 text-sm">
               {perExpiry.map((r) => (
-                <li key={r.expiration} className="flex items-center justify-between">
-                  <span className="font-mono text-muted-foreground">{r.expiration}</span>
-                  <span className="font-mono">{formatStrike(r.strike)}</span>
+                <li
+                  key={r.expiration}
+                  className="flex items-center justify-between rounded px-2 py-1 hover:bg-bg-card-hover/60"
+                >
+                  <span className="font-mono text-xs text-fg-muted tabular-nums">
+                    {r.expiration}
+                  </span>
+                  <span className="font-mono text-sm font-semibold tabular-nums text-fg-primary">
+                    {formatStrike(r.strike)}
+                  </span>
                 </li>
               ))}
             </ul>
           )}
-        </CardContent>
-      </Card>
+        </CardBody>
+      </SurfaceCard>
     </div>
   );
 }
